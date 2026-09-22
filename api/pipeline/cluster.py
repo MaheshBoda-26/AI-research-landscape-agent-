@@ -112,6 +112,9 @@ def cluster_labels(
     if count == 0:
         return np.zeros(0, dtype=int)
 
+    # An explicit min_cluster_size is an instruction; the derived one is a
+    # heuristic, and heuristics need a safety net (see the fallback below).
+    auto_sized = settings.hdbscan_min_cluster_size <= 0
     min_cluster_size = settings.hdbscan_min_cluster_size or max(3, count // 12)
     if count < min_cluster_size:
         logger.info(
@@ -121,6 +124,7 @@ def cluster_labels(
         )
         return np.full(count, UNCLUSTERED_LABEL, dtype=int)
 
+    injected = clusterer is not None
     if clusterer is None:
         from sklearn.cluster import HDBSCAN
 
@@ -140,6 +144,19 @@ def cluster_labels(
         logger.warning("Clustering failed (%s); treating every paper as unclustered", exc)
         return np.full(count, UNCLUSTERED_LABEL, dtype=int)
 
+    if auto_sized and not injected and count_clusters(labels) == 0:
+        # HDBSCAN found no density structure at all. On small corpora this is
+        # near-arbitrary rather than meaningful: a real 19-paper landscape gave
+        # zero clusters at min_samples=3 and three clusters plus 37% noise at
+        # min_samples=2. Rendering that as nineteen grey dots communicates
+        # nothing, so treat the set as the single region it evidently is and let
+        # the naming stage describe it. Only for the derived threshold -- an
+        # explicit HDBSCAN_MIN_CLUSTER_SIZE means the caller wants silence.
+        logger.info(
+            "No density structure in %d papers; treating the set as one region", count
+        )
+        labels = np.zeros(count, dtype=int)
+
     noise = int(np.sum(labels == UNCLUSTERED_LABEL))
     logger.info(
         "Clustered %d papers into %d cluster(s); %d unclustered",
@@ -147,7 +164,7 @@ def cluster_labels(
         count_clusters(labels),
         noise,
     )
-    if noise > count // 3:
+    if noise and noise > count // 3:
         # A map that is a third grey dots has failed at the one thing it is for.
         # Worth a warning because the usual cause is a settings change.
         logger.warning(

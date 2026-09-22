@@ -141,6 +141,82 @@ def test_a_single_outlier_never_becomes_its_own_cluster(settings: Settings):
     assert len(groups[-1]) == 1
 
 
+#: The literal 2D coordinates of a real 19-paper landscape ("mixture-of-experts
+#: routing") that HDBSCAN placed entirely in the noise bucket. Real data, kept
+#: verbatim, because a synthetic cloud does not reproduce the failure:
+#: UMAP output this small has no density gradient for HDBSCAN to find.
+REAL_DEGENERATE_LAYOUT = np.array(
+    [
+        [-0.1703, 0.3824], [0.1922, -0.1518], [0.2029, 0.2865],
+        [-0.3924, -0.1449], [-0.6449, 0.2188], [0.5322, 0.0292],
+        [0.2535, -0.4524], [0.4682, 0.6668], [-0.0669, -0.788],
+        [0.7371, 0.2924], [0.1128, 0.8744], [-0.602, -0.7999],
+        [0.7185, -0.6007], [-0.748, -0.4877], [-0.2646, 0.0365],
+        [-0.228, -0.4006], [1.0, -0.3857], [-0.4291, 0.8272],
+        [-0.6713, 0.5973],
+    ],
+    dtype=np.float32,
+)
+
+
+def test_the_real_degenerate_layout_really_does_yield_no_clusters():
+    """Pins the premise of the fallback test below.
+
+    If a future settings change makes HDBSCAN find structure here, the fallback
+    stops being exercised and this test says so.
+    """
+    from sklearn.cluster import HDBSCAN
+
+    labels = HDBSCAN(min_cluster_size=3, min_samples=3).fit_predict(
+        REAL_DEGENERATE_LAYOUT
+    )
+    assert count_clusters(labels) == 0
+
+
+def test_a_small_coherent_corpus_is_one_region_not_nineteen_grey_dots(
+    settings: Settings,
+):
+    """Nineteen anonymous dots is not a map.
+
+    When HDBSCAN finds nothing at all, the honest reading is that the corpus is
+    one region -- and the naming stage can then describe it.
+    """
+    labels = cluster_labels(REAL_DEGENERATE_LAYOUT, settings)
+    assert count_clusters(labels) == 1
+    assert int(np.sum(labels == -1)) == 0
+
+
+def test_the_fallback_does_not_apply_to_an_explicit_min_cluster_size(
+    settings: Settings,
+):
+    """An explicit threshold is an instruction to stay quiet, not a hint."""
+    labels = cluster_labels(
+        REAL_DEGENERATE_LAYOUT, replace(settings, hdbscan_min_cluster_size=25)
+    )
+    assert count_clusters(labels) == 0
+
+
+def test_the_fallback_does_not_override_an_injected_clusterer(
+    settings: Settings,
+):
+    """A caller-supplied clusterer's verdict is final, noise included."""
+
+    class AllNoise:
+        def fit_predict(self, coords: np.ndarray) -> np.ndarray:
+            return np.full(coords.shape[0], -1, dtype=int)
+
+    labels = cluster_labels(
+        REAL_DEGENERATE_LAYOUT, settings, clusterer=AllNoise()
+    )
+    assert set(labels) == {-1}
+
+
+def test_the_fallback_never_hides_a_healthy_landscape(settings: Settings):
+    """The safety net must not fire when real structure exists."""
+    labels = cluster_labels(blobs(sizes=(20, 20, 20)), settings)
+    assert count_clusters(labels) == 3
+
+
 def test_group_labels_keeps_noise_as_its_own_key():
     labels = np.array([0, 0, -1, 1, 1, 1])
     groups = group_labels(labels)
