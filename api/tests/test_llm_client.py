@@ -106,6 +106,31 @@ def test_json_containing_braces_inside_a_string_parses():
     assert parse_into(raw, Verdict).score == 1.0
 
 
+def test_a_fields_wrapped_response_parses():
+    """Some chat models nest the requested object under a wrapper key.
+
+    Observed live from this catalogue's chat-tuned model: asked for
+    ``{label, score}`` it replied ``{"fields": {"label": ..., "score": ...}}``.
+    """
+    assert parse_into('{"fields": {"label": "x", "score": 2.0}}', Verdict).score == 2.0
+
+
+def test_a_result_wrapped_response_parses():
+    assert parse_into('{"result": ' + VALID + "}", Verdict).label == "relevant"
+
+
+def test_a_partially_wrapped_response_still_fails_loudly():
+    """A wrapper whose contents are wrong must not validate."""
+    with pytest.raises(ValidationError):
+        parse_into('{"fields": {"label": "x", "score": 99.0}}', Verdict)
+
+
+def test_a_wrapper_with_extra_siblings_does_not_lose_them_silently():
+    """When the wrapper's inner object fails, the error is a validation error."""
+    with pytest.raises(ValidationError):
+        parse_into('{"fields": {"label": "x"}}', Verdict)
+
+
 def test_invalid_json_raises_validation_error():
     with pytest.raises(ValidationError):
         parse_into("not json at all", Verdict)

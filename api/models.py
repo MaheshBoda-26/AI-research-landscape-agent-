@@ -158,10 +158,24 @@ class PaperExtraction(BaseModel):
         "limitations",
     )
 
-    @field_validator("datasets", "metrics", "evidence", mode="before")
+    @field_validator("datasets", "metrics", mode="before")
     @classmethod
     def _coerce_none(cls, value: object) -> object:
         return [] if value is None else value
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _drop_null_evidence(cls, value: object) -> object:
+        """Models emit ``{"results": null}`` for fields they skipped.
+
+        The prompt says not to, but a strict dict[str, str] turns the whole
+        extraction into a failed one, and the repair loop cannot fix a model
+        that keeps doing it. A null quote carries no information; dropping the
+        entry is what the model meant.
+        """
+        if isinstance(value, dict):
+            return {k: v for k, v in value.items() if v is not None}
+        return value
 
 
 class JudgeScore(BaseModel):

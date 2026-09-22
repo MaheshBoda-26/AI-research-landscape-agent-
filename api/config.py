@@ -79,7 +79,11 @@ class Settings:
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     # Deliberately not a guess: this slug is the one already in use in the
     # RAG-Pipeline project. Confirm against GET /v1/models before a real run.
-    llm_model: str = "meta/llama-3.1-70b-instruct"
+    # Verified against GET /v1/models on integrate.api.nvidia.com (2026-09):
+    # the slug every tutorial uses, meta/llama-3.1-70b-instruct, is NOT in the
+    # catalogue; the nemotron tune is. /v1/models exists so a replacement can
+    # be confirmed before it is set, not guessed.
+    llm_model: str = "nvidia/llama-3.1-nemotron-70b-instruct"
     llm_concurrency: int = 4
     llm_max_repairs: int = 2
     llm_timeout_seconds: int = 120
@@ -143,7 +147,7 @@ class Settings:
             nvidia_base_url=_str("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/"),
             openrouter_api_key=_str("OPENROUTER_API_KEY", ""),
             openrouter_base_url=_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
-            llm_model=_str("LLM_MODEL", "meta/llama-3.1-70b-instruct"),
+            llm_model=_str("LLM_MODEL", "nvidia/llama-3.1-nemotron-70b-instruct"),
             llm_concurrency=_int("LLM_CONCURRENCY", 4),
             llm_max_repairs=_int("LLM_MAX_REPAIRS", 2),
             llm_timeout_seconds=_int("LLM_TIMEOUT_SECONDS", 120),

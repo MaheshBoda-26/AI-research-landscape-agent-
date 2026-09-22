@@ -100,6 +100,28 @@ def candidate_json_payloads(raw: str) -> list[str]:
     return unique
 
 
+def _unwrap_nested_object(payload: str) -> str | None:
+    """Flatten ``{"fields": {...}}`` and ``{"result": {...}}`` wrappers.
+
+    Some chat-tuned models answer a schema request by nesting the requested
+    object under a wrapper key (observed live: this model produced
+    ``{"fields": {<everything asked for>}}``). Pydantic rejects that as missing
+    fields, so before giving up, check whether exactly one top-level key holds
+    an object that validates on its own.
+    """
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    for wrapper in ("fields", "result", "output", "response", "data"):
+        inner = parsed.get(wrapper)
+        if isinstance(inner, dict):
+            return json.dumps(inner)
+    return None
+
+
 def parse_into(raw: str, schema: type[SchemaT]) -> SchemaT:
     """Parse a raw model response into ``schema``, or raise ``ValidationError``.
 
@@ -120,6 +142,14 @@ def parse_into(raw: str, schema: type[SchemaT]) -> SchemaT:
             last_error = exc
         except (ValueError, TypeError) as exc:
             last_error = exc
+        # The wrapper probe: only worth one extra attempt per payload, and only
+        # reached when the direct parse just failed.
+        unwrapped = _unwrap_nested_object(payload)
+        if unwrapped is not None and unwrapped != payload:
+            try:
+                return schema.model_validate_json(unwrapped)
+            except (ValidationError, ValueError, TypeError) as exc:
+                last_error = exc
     if isinstance(last_error, ValidationError):
         raise last_error
     raise ValidationError.from_exception_data(
