@@ -124,7 +124,15 @@ def cluster_labels(
     if clusterer is None:
         from sklearn.cluster import HDBSCAN
 
-        clusterer = HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
+        clusterer = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            # Without this, sklearn leaves ``min_samples`` at ``min_cluster_size``
+            # and HDBSCAN rejects boundary points as noise: measured on a real
+            # 60-paper landscape, 24 of them. Lowering it to 2 fixes the noise
+            # but over-splits clean structure, so 3 is the default.
+            min_samples=max(1, min(settings.hdbscan_min_samples, min_cluster_size)),
+            metric="euclidean",
+        )
 
     try:
         labels = np.asarray(clusterer.fit_predict(coords), dtype=int)
@@ -132,12 +140,23 @@ def cluster_labels(
         logger.warning("Clustering failed (%s); treating every paper as unclustered", exc)
         return np.full(count, UNCLUSTERED_LABEL, dtype=int)
 
+    noise = int(np.sum(labels == UNCLUSTERED_LABEL))
     logger.info(
         "Clustered %d papers into %d cluster(s); %d unclustered",
         count,
         count_clusters(labels),
-        int(np.sum(labels == UNCLUSTERED_LABEL)),
+        noise,
     )
+    if noise > count // 3:
+        # A map that is a third grey dots has failed at the one thing it is for.
+        # Worth a warning because the usual cause is a settings change.
+        logger.warning(
+            "%d of %d papers (%.0f%%) are unclustered; consider lowering "
+            "HDBSCAN_MIN_SAMPLES",
+            noise,
+            count,
+            100.0 * noise / count,
+        )
     return labels
 
 

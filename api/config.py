@@ -111,6 +111,13 @@ class Settings:
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
     hdbscan_min_cluster_size: int = 0  # 0 => auto
+    # HDBSCAN defaults ``min_samples`` to ``min_cluster_size``, which is far more
+    # conservative than a reading map can afford: on a real 60-paper landscape
+    # that default labelled 24 papers (40%) as noise -- one grey blob. Measured
+    # across both the real layout and the synthetic fixtures, 3 is the lowest
+    # value that keeps well-separated structure intact (at 2, three clean blobs
+    # split into four clusters and a lone outlier becomes its own cluster).
+    hdbscan_min_samples: int = 3
 
     # --- Storage ---
     db_path: Path = field(default_factory=lambda: PROJECT_ROOT / "data/landscapes.db")
@@ -162,6 +169,7 @@ class Settings:
             umap_n_neighbors=_int("UMAP_N_NEIGHBORS", 15),
             umap_min_dist=_float("UMAP_MIN_DIST", 0.1),
             hdbscan_min_cluster_size=_int("HDBSCAN_MIN_CLUSTER_SIZE", 0),
+            hdbscan_min_samples=max(1, _int("HDBSCAN_MIN_SAMPLES", 3)),
             db_path=_path("DB_PATH", "./data/landscapes.db"),
             prompt_version=_str("PROMPT_VERSION", "extract_v1"),
             api_port=_int("API_PORT", 8000),

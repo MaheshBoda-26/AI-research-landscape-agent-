@@ -63,12 +63,12 @@ def fake_ranked(papers: list[Paper]) -> list[RankedPaper]:
 
 def fake_extractions(papers: list[Paper]) -> dict[str, PaperExtraction]:
     out = {}
-    for index, paper in enumerate(papers):
-        # Grounded in the abstract built above, so the evidence check passes.
-        quote = (
-            "improves exact match by "
-            f"{PAPERS.index(paper) if paper in PAPERS else index} points"
-        )
+    for paper in papers:
+        # Sliced out of the paper's own abstract, so the quote is genuinely
+        # verbatim however the caller ordered the papers.
+        marker = "improves exact match by"
+        start = paper.abstract.index(marker)
+        quote = paper.abstract[start : paper.abstract.index(" points", start) + len(" points")]
         out[paper.paper_id] = PaperExtraction(
             problem="Grounding generation in retrieved evidence.",
             method="Dense retrieval plus a seq2seq generator.",
@@ -103,13 +103,24 @@ def patched(monkeypatch):
     )
 
     def fake_extract_all(papers, completer, settings, conn, on_progress=None):
+        """Stand in for the LLM call, but persist exactly like the real one.
+
+        Writing through ``store.upsert_extraction`` is what makes the
+        read-back assertions meaningful: the API serves extractions out of the
+        database, not out of pipeline memory.
+        """
         out = fake_extractions(list(papers))
         if on_progress:
             on_progress(len(papers), len(papers))
+        if conn is not None:
+            for paper_id, extraction in out.items():
+                store.upsert_extraction(
+                    conn, paper_id, settings.prompt_version, extraction, model="test"
+                )
+            conn.commit()
         return out
 
     monkeypatch.setattr("pipeline.stages.extract_mod.extract_all", fake_extract_all)
-    monkeypatch.setattr("pipeline.stages.extract_mod.has_grounded_content", lambda e: True)
 
     def fake_embed(papers, settings, conn=None, embedder=None):
         return {

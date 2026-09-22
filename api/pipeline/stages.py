@@ -263,7 +263,7 @@ class PipelineRun:
     async def _stage_rerank(self) -> AsyncIterator[StageEvent]:
         total = len(self.state.papers)
         yield self._event(
-            "rerank", "running", f"Scoring {total} candidates", progress=StageProgress(0, total)
+            "rerank", "running", f"Scoring {total} candidates", progress=StageProgress(current=0, total=total)
         )
 
         settings = self.settings
@@ -320,7 +320,7 @@ class PipelineRun:
             "extraction",
             "running",
             f"Reading {total} abstracts",
-            progress=StageProgress(0, total),
+            progress=StageProgress(current=0, total=total),
         )
 
         settings = self.settings
@@ -359,7 +359,7 @@ class PipelineRun:
             "layout",
             "running",
             f"Projecting {total} papers",
-            progress=StageProgress(0, total),
+            progress=StageProgress(current=0, total=total),
         )
 
         settings = self.settings

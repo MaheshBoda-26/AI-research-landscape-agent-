@@ -184,6 +184,59 @@ def test_explicit_min_cluster_size_overrides_the_auto_rule(settings: Settings):
     assert count_clusters(labels) == 0
 
 
+def capture_clusterer(monkeypatch) -> dict[str, object]:
+    """Replace sklearn's HDBSCAN with a stub that records its constructor kwargs.
+
+    The constructor is imported lazily inside ``cluster_labels``, so the patch
+    has to land on ``sklearn.cluster`` rather than on ``pipeline.cluster``.
+    """
+    seen: dict[str, object] = {}
+
+    class Recording:
+        def fit_predict(self, coords: np.ndarray) -> np.ndarray:
+            return np.zeros(coords.shape[0], dtype=int)
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return Recording()
+
+    monkeypatch.setattr("sklearn.cluster.HDBSCAN", capture)
+    return seen
+
+
+def test_min_samples_is_threaded_through_from_settings(settings: Settings, monkeypatch):
+    """Regression guard.
+
+    sklearn leaves ``min_samples`` at ``min_cluster_size`` unless it is passed
+    explicitly, which on a real landscape marked 40% of papers as noise. If the
+    setting ever stops reaching the clusterer, this fails.
+    """
+    seen = capture_clusterer(monkeypatch)
+    cluster_labels(blobs(), replace(settings, hdbscan_min_cluster_size=9))
+    assert seen["min_samples"] == settings.hdbscan_min_samples
+    assert seen["min_cluster_size"] == 9
+
+
+def test_min_samples_never_exceeds_min_cluster_size(settings: Settings, monkeypatch):
+    """A min_samples above min_cluster_size makes HDBSCAN reject everything."""
+    seen = capture_clusterer(monkeypatch)
+    cluster_labels(
+        blobs(), replace(settings, hdbscan_min_cluster_size=3, hdbscan_min_samples=50)
+    )
+    assert seen["min_samples"] == 3
+
+
+def test_a_typical_landscape_is_mostly_clustered(settings: Settings):
+    """The product requirement: few grey dots.
+
+    Three well-separated groups of twenty. The default configuration must
+    assign nearly all of them to a real cluster.
+    """
+    labels = cluster_labels(blobs(sizes=(20, 20, 20)), settings)
+    assert count_clusters(labels) == 3
+    assert int(np.sum(labels == -1)) <= 3
+
+
 def test_centroids_land_near_their_blobs(settings: Settings):
     coords = blobs(sizes=(12, 12, 12))
     labels = cluster_labels(coords, settings)
