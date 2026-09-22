@@ -33,61 +33,67 @@ from pipeline import rerank, retrieve  # noqa: E402
 
 STAGES = ("retrieve", "rerank", "extract", "layout", "synthesize")
 
+#: Human-readable progress goes here. In ``--json`` mode this is redirected to
+#: stderr so that stdout carries nothing but parseable JSON.
+_PROGRESS = sys.stdout
+
+
+def say(message: str = "") -> None:
+    print(message, file=_PROGRESS)
+
 
 def _truncate(text: str, width: int) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def print_papers(papers: list[Paper], *, limit: int, show_score: bool = False) -> None:
+def print_papers(papers: list[Paper], *, limit: int) -> None:
     if not papers:
-        print("  (no papers)")
+        say("  (no papers)")
         return
-    print(f"  {'#':>3}  {'score':>6}  {'id':<14}  title" if show_score else f"  {'#':>3}  {'id':<14}  title")
+    say(f"  {'#':>3}  {'id':<14}  title")
     for index, paper in enumerate(papers[:limit], start=1):
-        prefix = f"  {index:>3}"
-        if show_score:
-            prefix += f"  {getattr(paper, 'relevance_score', 0.0):>6.2f}"
-        print(f"{prefix}  {paper.paper_id:<14}  {_truncate(paper.title, 68)}")
+        say(f"  {index:>3}  {paper.paper_id:<14}  {_truncate(paper.title, 68)}")
     if len(papers) > limit:
-        print(f"  ... and {len(papers) - limit} more")
+        say(f"  ... and {len(papers) - limit} more")
 
 
 def stage_retrieve(args, settings: Settings) -> list[Paper]:
-    print(f"\n[retrieve] searching arXiv for {args.topic!r}")
-    papers = retrieve.fetch_candidates(
-        args.topic, settings, force_refresh=args.refresh
-    )
-    print(f"[retrieve] {len(papers)} unique papers after version dedup\n")
-    print_papers(papers, limit=args.limit)
+    say(f"\n[retrieve] searching arXiv for {args.topic!r}")
+    papers = retrieve.fetch_candidates(args.topic, settings, force_refresh=args.refresh)
+    say(f"[retrieve] {len(papers)} unique papers after version dedup")
+    if not args.json:
+        print_papers(papers, limit=args.limit)
     return papers
 
 
 def stage_rerank(args, settings: Settings, papers: list[Paper]) -> list[RankedPaper]:
     completer = make_completer(settings) if args.llm else None
-    print(f"\n[rerank] scoring {len(papers)} candidates")
+    say(f"\n[rerank] scoring {len(papers)} candidates")
     if completer is None:
-        print("[rerank] no LLM: cross-encoder only (pass --llm to blend in the judge)")
+        say("[rerank] no LLM: cross-encoder only (pass --llm to blend in the judge)")
     ranked = rerank.rank_papers(args.topic, papers, settings, completer)
 
     counts: dict[str, int] = {}
     for item in ranked:
         counts[item.rerank_source] = counts.get(item.rerank_source, 0) + 1
-    print(f"[rerank] sources: {counts}\n")
+    say(f"[rerank] sources: {counts}")
 
     final = rerank.select_top(ranked, settings.rerank_final_count)
-    # The calibrated score (abs) saturates near 10 for a retrieved candidate set,
-    # so display the raw logit and the relative percentile alongside it. Without
-    # these two columns every row reads "10.00" and the ranking looks arbitrary.
-    print(f"  {'#':>3}  {'abs':>6}  {'logit':>6}  {'rel':>5}  {'src':<13}  {'id':<14}  title")
-    for item in final[: args.limit]:
-        logit = "-" if item.cross_encoder_logit is None else f"{item.cross_encoder_logit:.2f}"
-        rel = "-" if item.relative_score is None else f"{item.relative_score:.1f}"
-        print(
-            f"  {item.rank:>3}  {item.relevance_score:>6.2f}  {logit:>6}  {rel:>5}  "
-            f"{item.rerank_source:<13}  {item.paper.paper_id:<14}  "
-            f"{_truncate(item.paper.title, 40)}"
-        )
+    if not args.json:
+        # The calibrated score (abs) saturates near 10 for a retrieved candidate
+        # set, so display the raw logit and the relative percentile beside it.
+        # Without those two columns every row reads "10.00" and the ranking looks
+        # arbitrary to a reader.
+        say(f"  {'#':>3}  {'abs':>6}  {'logit':>6}  {'rel':>5}  {'src':<13}  {'id':<14}  title")
+        for item in final[: args.limit]:
+            logit = "-" if item.cross_encoder_logit is None else f"{item.cross_encoder_logit:.2f}"
+            rel = "-" if item.relative_score is None else f"{item.relative_score:.1f}"
+            say(
+                f"  {item.rank:>3}  {item.relevance_score:>6.2f}  {logit:>6}  {rel:>5}  "
+                f"{item.rerank_source:<13}  {item.paper.paper_id:<14}  "
+                f"{_truncate(item.paper.title, 40)}"
+            )
     return final
 
 
@@ -128,7 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _PROGRESS
     args = build_parser().parse_args(argv)
+    if args.json:
+        _PROGRESS = sys.stderr
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
