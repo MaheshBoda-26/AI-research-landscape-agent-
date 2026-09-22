@@ -199,6 +199,24 @@ def test_unknown_landscape_is_404(client):
     assert client.get("/v1/landscapes/9999").status_code == 404
 
 
+def test_an_id_beyond_sqlite_range_is_not_a_500(client):
+    """Regression guard.
+
+    An id larger than sqlite's int64 overflows the driver inside the query and
+    surfaced as a 500 with a stack trace. The path parameter is now bounded, so
+    it is rejected at validation time.
+    """
+    huge = 2**63  # first value that no longer fits sqlite's INTEGER
+    for path in (
+        f"/v1/landscapes/{huge}",
+        f"/v1/landscapes/{huge}/papers/x",
+        f"/v1/landscapes/{huge}/runs",
+    ):
+        assert client.get(path).status_code == 422, path
+    assert client.delete(f"/v1/landscapes/{huge}").status_code == 422
+    assert client.post(f"/v1/landscapes/{huge}/expand", json={}).status_code == 422
+
+
 def test_unknown_paper_is_404(client):
     assert client.get("/v1/landscapes/9999/papers/nope").status_code == 404
 

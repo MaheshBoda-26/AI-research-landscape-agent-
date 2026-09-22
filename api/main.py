@@ -37,6 +37,11 @@ from pipeline.stages import PipelineRun
 
 logger = logging.getLogger(__name__)
 
+#: SQLite integers are 64-bit; a larger path id overflows the driver and
+#: becomes a 500. Bound the path parameter so overflow is a 404/422 instead.
+#: Value from sqlite3's limit, sqlite3.sqlite_version_info's era: 2**63 - 1.
+MAX_SQLITE_INT = 2**63 - 1
+
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
@@ -156,7 +161,7 @@ def list_landscapes() -> list[LandscapeSummary]:
 
 
 @app.get("/v1/landscapes/{landscape_id}", response_model=LandscapeDetail)
-def get_landscape(landscape_id: int = Path(ge=1)) -> LandscapeDetail:
+def get_landscape(landscape_id: int = Path(ge=1, le=MAX_SQLITE_INT)) -> LandscapeDetail:
     settings = _settings()
     with store.session(settings) as conn:
         detail = service.build_detail(conn, landscape_id, settings)
@@ -166,7 +171,7 @@ def get_landscape(landscape_id: int = Path(ge=1)) -> LandscapeDetail:
 
 
 @app.get("/v1/landscapes/{landscape_id}/papers/{paper_id}")
-def get_paper(landscape_id: int = Path(ge=1), paper_id: str = Path(min_length=1)) -> dict[str, Any]:
+def get_paper(landscape_id: int = Path(ge=1, le=MAX_SQLITE_INT), paper_id: str = Path(min_length=1)) -> dict[str, Any]:
     settings = _settings()
     with store.session(settings) as conn:
         paper = service.fetch_paper_detail(conn, landscape_id, paper_id, settings)
@@ -179,7 +184,7 @@ def get_paper(landscape_id: int = Path(ge=1), paper_id: str = Path(min_length=1)
 
 
 @app.delete("/v1/landscapes/{landscape_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_landscape(landscape_id: int = Path(ge=1)) -> Response:
+def delete_landscape(landscape_id: int = Path(ge=1, le=MAX_SQLITE_INT)) -> Response:
     settings = _settings()
     with store.session(settings) as conn:
         if store.fetch_landscape(conn, landscape_id) is None:
@@ -190,7 +195,7 @@ def delete_landscape(landscape_id: int = Path(ge=1)) -> Response:
 
 
 @app.get("/v1/landscapes/{landscape_id}/runs")
-def get_runs(landscape_id: int = Path(ge=1)) -> dict[str, Any]:
+def get_runs(landscape_id: int = Path(ge=1, le=MAX_SQLITE_INT)) -> dict[str, Any]:
     """Replay the persisted stage events, for a client that reconnected."""
     settings = _settings()
     with store.session(settings) as conn:
@@ -224,7 +229,7 @@ async def stream_landscape(request: TopicRequest = Body(...)) -> StreamingRespon
 
 @app.post("/v1/landscapes/{landscape_id}/expand")
 async def expand_landscape(
-    landscape_id: int = Path(ge=1), body: ExpandRequest | None = Body(default=None)
+    landscape_id: int = Path(ge=1, le=MAX_SQLITE_INT), body: ExpandRequest | None = Body(default=None)
 ) -> StreamingResponse:
     """Grow an existing landscape, re-ranking the whole corpus."""
     settings = _settings()
