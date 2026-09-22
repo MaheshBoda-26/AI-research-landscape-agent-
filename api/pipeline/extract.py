@@ -133,6 +133,11 @@ def enforce_evidence(extraction: PaperExtraction, abstract: str) -> PaperExtract
     return PaperExtraction(**updates)  # type: ignore[arg-type]
 
 
+def has_grounded_content(extraction: PaperExtraction) -> bool:
+    """True when at least one prose field survived grounding."""
+    return any(getattr(extraction, field, None) for field in PaperExtraction.EXTRACTED_FIELDS)
+
+
 def unextracted(paper_id: str = "") -> PaperExtraction:
     """The stored result of a failed extraction.
 
@@ -215,7 +220,12 @@ def extract_all(
 
     if not todo or completer is None:
         if completer is None and todo:
-            logger.warning("No LLM client; %d papers will be stored unextracted", len(todo))
+            # Deliberately NOT persisted. Writing null records here would make
+            # the next run -- the one that finally has an API key -- see a cache
+            # hit and skip extraction forever.
+            logger.warning(
+                "No LLM client; %d papers returned unextracted and uncached", len(todo)
+            )
             for paper in todo:
                 cached[paper.paper_id] = unextracted(paper.paper_id)
         if on_progress is not None:
@@ -246,11 +256,19 @@ def extract_all(
         from store import upsert_extraction
 
         model = getattr(completer, "model_name", "") or "unknown"
+        written = 0
         for paper_id in ordered_ids:
-            upsert_extraction(
-                conn, paper_id, prompt_version, results[paper_id], model=str(model)
-            )
+            extraction = results[paper_id]
+            # Cache only extractions that actually yielded grounded content.
+            # Caching a total failure would make a transient provider outage
+            # permanent, because the next run would hit the cache and skip it.
+            if not has_grounded_content(extraction):
+                logger.info("Not caching an empty extraction for %s; it will retry", paper_id)
+                continue
+            upsert_extraction(conn, paper_id, prompt_version, extraction, model=str(model))
+            written += 1
         conn.commit()
+        logger.info("Cached %d of %d extractions", written, len(ordered_ids))
 
     merged = dict(cached)
     merged.update(results)
@@ -262,6 +280,7 @@ __all__ = [
     "enforce_evidence",
     "extract_all",
     "extract_one",
+    "has_grounded_content",
     "is_verbatim",
     "normalize_for_match",
     "unextracted",

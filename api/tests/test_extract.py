@@ -180,7 +180,14 @@ def test_multiple_violations_are_all_reported():
             "results": "invented results text that is not present",
         }
     )
-    assert sorted(ungrounded_fields(bad, ABSTRACT)) == ["contribution", "limitations", "results"]
+    # contribution and limitations have no evidence entry at all; method and
+    # results have entries whose quotes are invented.
+    assert sorted(ungrounded_fields(bad, ABSTRACT)) == [
+        "contribution",
+        "limitations",
+        "method",
+        "results",
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -333,11 +340,39 @@ def test_extractions_are_persisted_under_the_prompt_version(settings: Settings, 
     assert store.fetch_extraction(conn, "p1", "other_version") is None
 
 
-def test_extract_all_without_a_completer_stores_null_records(settings: Settings, conn, stored_papers):
-    """An LLM outage yields null extractions, not a failed run."""
+def test_extract_all_without_a_completer_returns_null_records_but_caches_nothing(
+    settings: Settings, conn, stored_papers
+):
+    """An absent LLM yields null extractions, not a failed run.
+
+    Crucially they must NOT be cached: a null cached under this prompt_version
+    would be a cache hit on the next run -- the one that finally has an API key
+    -- and extraction would never happen.
+    """
     results = extract_all(stored_papers, None, settings, conn)
     assert all(r.problem is None for r in results.values())
+    assert store.fetch_extraction(conn, "p1", settings.prompt_version) is None
+
+
+def test_a_failed_extraction_is_not_cached_so_it_retries(settings: Settings, conn, stored_papers):
+    """A transient provider outage must not become permanent."""
+    failing = ScriptedCompleter([None, None])
+    extract_all(stored_papers, failing, settings, conn)
+    assert store.fetch_extraction(conn, "p1", settings.prompt_version) is None
+
+    working = ScriptedCompleter([grounded(), grounded()])
+    extract_all(stored_papers, working, settings, conn)
+    assert len(working.prompts) == 2
     assert store.fetch_extraction(conn, "p1", settings.prompt_version) is not None
+
+
+def test_a_fully_ungrounded_extraction_is_not_cached(settings: Settings, conn, stored_papers):
+    """Nothing usable was produced, so it does not count as extracted."""
+    bogus = PaperExtraction(
+        problem="invented", method="invented", evidence={"problem": "invented"}, confidence=0.9
+    )
+    extract_all(stored_papers, ScriptedCompleter([bogus, bogus, bogus, bogus]), settings, conn)
+    assert store.fetch_extraction(conn, "p1", settings.prompt_version) is None
 
 
 def test_progress_callback_walks_from_zero_to_total(settings: Settings, conn, stored_papers):
