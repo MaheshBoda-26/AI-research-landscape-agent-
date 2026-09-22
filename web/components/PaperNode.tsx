@@ -51,7 +51,7 @@ export const PaperNode = memo(function PaperNode({ data }: NodeProps<PaperFlowNo
         width: 180,
         height: 60,
         scale: String(0.92 + weight * 0.12),
-      }}
+      } as React.CSSProperties}
       className="focus-ring press cursor-pointer rounded-[var(--radius-md)] border bg-[var(--color-panel)] px-2.5 py-1.5 text-left hover:border-[var(--node-color)]"
     >
       <Handle type="target" position={Position.Top} className="opacity-0" />

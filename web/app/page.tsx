@@ -65,7 +65,7 @@ export default function HomePage() {
   return (
     <main className="app-main mx-auto w-full max-w-3xl px-6 py-16">
       <div className="mb-12 text-center">
-        <h1>What do you want to understand?</h1>
+        <h1 className="display">What do you want to understand?</h1>
         <p className="mx-auto mt-4 max-w-xl text-[15px] leading-relaxed text-[var(--color-ink-secondary)]">
           Enter an ML topic in plain English. arXiv supplies the candidates, the
           model reads and ranks them, and you get a map of the area rather than
