@@ -1,18 +1,29 @@
 """SQLite persistence layer.
 
-Design notes:
+Deliberately stdlib ``sqlite3`` and not an ORM: the schema is small, every table
+is auditable, and there is nothing to invent. WAL mode is enabled so a streaming
+pipeline run can keep writing stage events while the API reads a previous
+landscape.
 
-* **stdlib ``sqlite3``, no ORM.** Every table's DDL is explicit and reviewable
-  here, so there is nothing to invent and no dependency-version risk.
-* **WAL mode + a connection per operation.** SQLite connections are not
-  shareable across threads, and this pipeline mixes the event-loop thread with
-  ``asyncio.to_thread`` workers (the arXiv client, cross-encoder, and UMAP are
-  all synchronous). Opening a short-lived connection per call is cheap and
-  sidesteps the whole class of "SQLite objects created in a thread can only be
-  used in that same thread" errors.
-* **Rows come back as dicts.** Callers build Pydantic models from them.
-* **JSON columns are TEXT.** SQLite has no native JSON type; ``_dumps``/``_loads``
-  keep the encoding in one place.
+Key modelling decisions:
+
+* ``papers`` is keyed by the **version-stripped** arXiv id and is shared across
+  every landscape. It is the dedup boundary: ``arxiv.Result.__eq__`` compares
+  ``entry_id``, which includes the ``vN`` suffix, so v1 and v3 of the same paper
+  are distinct upstream results and would both land in the map without stripping.
+* ``paper_extractions`` is keyed by ``(paper_id, prompt_version)`` so that
+  iterating on the extraction prompt never forces a re-embed or a re-layout.
+* ``paper_embeddings`` stores float32 vectors as BLOBs so a grown topic can be
+  re-projected without re-embedding a single paper.
+* ``reading_path`` is not in the original sketch of the schema; it is added here
+  because the synthesized reading order has to survive a server restart, and
+  ``LandscapeDetail.reading_path`` is part of the API contract.
+
+Every function takes an explicit connection. Callers use the ``session()``
+context manager, which owns commit/rollback and closes the connection. Opening a
+fresh connection per unit of work is intentional: it is cheap under WAL and it
+keeps connections from crossing thread boundaries when blocking work is pushed
+through ``asyncio.to_thread``.
 """
 
 from __future__ import annotations
@@ -21,26 +32,31 @@ import json
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
-from config import PROJECT_ROOT, Settings
-from models import Paper, PaperExtraction, utcnow
-
-# --------------------------------------------------------------------------- #
-# Schema
-# --------------------------------------------------------------------------- #
+from config import PROJECT_ROOT, Settings, load_settings
+from models import (
+    UNCLUSTERED_LABEL,
+    ClusterLabel,
+    EdgeClaim,
+    OpenProblem,
+    Paper,
+    PaperExtraction,
+    ReadingStep,
+    Tension,
+    utcnow,
+)
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS topics (
   id INTEGER PRIMARY KEY,
   query_text TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_query
-  ON topics(lower(trim(query_text)));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_query ON topics(lower(trim(query_text)));
 
 CREATE TABLE IF NOT EXISTS papers (
   paper_id     TEXT PRIMARY KEY,
@@ -48,15 +64,15 @@ CREATE TABLE IF NOT EXISTS papers (
   title        TEXT NOT NULL,
   abstract     TEXT NOT NULL,
   authors_json TEXT NOT NULL DEFAULT '[]',
-  published    TEXT NOT NULL DEFAULT '',
-  updated      TEXT NOT NULL DEFAULT '',
-  primary_category TEXT NOT NULL DEFAULT '',
+  published    TEXT DEFAULT '',
+  updated      TEXT DEFAULT '',
+  primary_category TEXT DEFAULT '',
   categories_json  TEXT NOT NULL DEFAULT '[]',
-  comment      TEXT NOT NULL DEFAULT '',
-  journal_ref  TEXT NOT NULL DEFAULT '',
-  doi          TEXT NOT NULL DEFAULT '',
+  comment TEXT DEFAULT '',
+  journal_ref TEXT DEFAULT '',
+  doi TEXT DEFAULT '',
   abs_url      TEXT NOT NULL DEFAULT '',
-  pdf_url      TEXT NOT NULL DEFAULT '',
+  pdf_url      TEXT DEFAULT '',
   fetched_at   TEXT NOT NULL
 );
 
@@ -73,7 +89,7 @@ CREATE TABLE IF NOT EXISTS landscapes (
   id INTEGER PRIMARY KEY,
   topic_id INTEGER NOT NULL REFERENCES topics(id),
   title TEXT NOT NULL,
-  summary TEXT NOT NULL DEFAULT '',
+  summary TEXT DEFAULT '',
   status TEXT NOT NULL DEFAULT 'running',
   params_json TEXT NOT NULL DEFAULT '{}',
   generation INTEGER NOT NULL DEFAULT 1,
@@ -87,7 +103,7 @@ CREATE TABLE IF NOT EXISTS landscape_papers (
   rank INTEGER NOT NULL,
   relevance_score REAL NOT NULL,
   rerank_source TEXT NOT NULL DEFAULT 'cross-encoder',
-  rationale TEXT NOT NULL DEFAULT '',
+  rationale TEXT DEFAULT '',
   is_seed INTEGER NOT NULL DEFAULT 0,
   cluster_id INTEGER,
   x REAL,
@@ -95,22 +111,20 @@ CREATE TABLE IF NOT EXISTS landscape_papers (
   added_at TEXT NOT NULL,
   PRIMARY KEY (landscape_id, paper_id)
 );
-CREATE INDEX IF NOT EXISTS idx_landscape_papers_rank
-  ON landscape_papers(landscape_id, rank);
+CREATE INDEX IF NOT EXISTS idx_landscape_papers_rank ON landscape_papers(landscape_id, rank);
 
 CREATE TABLE IF NOT EXISTS clusters (
   id INTEGER PRIMARY KEY,
   landscape_id INTEGER NOT NULL REFERENCES landscapes(id) ON DELETE CASCADE,
   local_label INTEGER NOT NULL,
-  label TEXT NOT NULL DEFAULT '',
-  description TEXT NOT NULL DEFAULT '',
+  label TEXT DEFAULT '',
+  description TEXT DEFAULT '',
   paper_count INTEGER NOT NULL DEFAULT 0,
-  x REAL,
-  y REAL,
-  color TEXT NOT NULL DEFAULT '#94a3b8'
+  x REAL DEFAULT 0,
+  y REAL DEFAULT 0,
+  color TEXT DEFAULT '#94a3b8'
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_clusters_unique
-  ON clusters(landscape_id, local_label);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clusters_unique ON clusters(landscape_id, local_label);
 
 CREATE TABLE IF NOT EXISTS edges (
   id INTEGER PRIMARY KEY,
@@ -119,7 +133,7 @@ CREATE TABLE IF NOT EXISTS edges (
   dst_paper_id TEXT NOT NULL,
   kind TEXT NOT NULL,
   weight REAL NOT NULL DEFAULT 0.5,
-  rationale TEXT NOT NULL DEFAULT ''
+  rationale TEXT DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
   ON edges(landscape_id, src_paper_id, dst_paper_id, kind);
@@ -128,25 +142,26 @@ CREATE TABLE IF NOT EXISTS tensions (
   id INTEGER PRIMARY KEY,
   landscape_id INTEGER NOT NULL REFERENCES landscapes(id) ON DELETE CASCADE,
   statement TEXT NOT NULL,
-  paper_a_id TEXT NOT NULL DEFAULT '',
-  paper_b_id TEXT NOT NULL DEFAULT ''
+  paper_a_id TEXT DEFAULT '',
+  paper_b_id TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS open_problems (
   id INTEGER PRIMARY KEY,
   landscape_id INTEGER NOT NULL REFERENCES landscapes(id) ON DELETE CASCADE,
   statement TEXT NOT NULL,
-  why_open TEXT NOT NULL DEFAULT '',
+  why_open TEXT DEFAULT '',
   supporting_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS reading_path (
+  id INTEGER PRIMARY KEY,
   landscape_id INTEGER NOT NULL REFERENCES landscapes(id) ON DELETE CASCADE,
   paper_id TEXT NOT NULL,
   position INTEGER NOT NULL,
-  why TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (landscape_id, paper_id)
+  why TEXT DEFAULT ''
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_path_unique ON reading_path(landscape_id, position);
 
 CREATE TABLE IF NOT EXISTS paper_extractions (
   paper_id TEXT NOT NULL REFERENCES papers(paper_id) ON DELETE CASCADE,
@@ -159,7 +174,7 @@ CREATE TABLE IF NOT EXISTS paper_extractions (
   limitations TEXT,
   datasets_json TEXT NOT NULL DEFAULT '[]',
   metrics_json TEXT NOT NULL DEFAULT '[]',
-  novelty TEXT NOT NULL DEFAULT 'unclear',
+  novelty TEXT DEFAULT 'unclear',
   evidence_json TEXT NOT NULL DEFAULT '{}',
   confidence REAL,
   created_at TEXT NOT NULL,
@@ -171,49 +186,41 @@ CREATE TABLE IF NOT EXISTS runs (
   landscape_id INTEGER REFERENCES landscapes(id) ON DELETE CASCADE,
   stage TEXT NOT NULL,
   status TEXT NOT NULL,
-  message TEXT NOT NULL DEFAULT '',
+  message TEXT DEFAULT '',
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_runs_landscape
-  ON runs(landscape_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_runs_landscape ON runs(landscape_id, created_at);
 """
 
 
+class StoreError(RuntimeError):
+    """Raised when a write cannot be completed."""
+
+
 # --------------------------------------------------------------------------- #
-# Connection plumbing
+# Connection handling
 # --------------------------------------------------------------------------- #
 
 
-def _dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)
+def connect(db_path: Path | str) -> sqlite3.Connection:
+    """Open a WAL-mode connection with row access by name.
 
-
-def _loads(raw: str | None, default: Any) -> Any:
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return default
-
-
-def connect(db_path: str | Any | None = None) -> sqlite3.Connection:
-    """Open a connection with the pragmas this schema depends on."""
-    target = db_path if db_path is not None else Settings.from_env().db_path
-    if target != ":memory:":
-        from pathlib import Path
-
-        Path(target).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(target), check_same_thread=False, timeout=30.0)
+    ``check_same_thread=False`` plus one connection per unit of work is what
+    makes it safe to call store functions from the worker threads that
+    ``asyncio.to_thread`` uses for the blocking arXiv client and model calls.
+    """
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
-def init_db(db_path: str | Any | None = None) -> None:
+def init_db(db_path: Path | str) -> None:
     """Apply the schema. Idempotent: safe to call on every startup."""
     conn = connect(db_path)
     try:
@@ -223,14 +230,17 @@ def init_db(db_path: str | Any | None = None) -> None:
         conn.close()
 
 
+def _resolve(settings: Settings | None) -> Settings:
+    return settings or load_settings(require_llm=False)
+
+
 @contextmanager
-def session(db_path: str | Any | None = None) -> Iterator[sqlite3.Connection]:
-    """Transactional connection: commits on success, rolls back on error."""
-    conn = connect(db_path)
+def session(settings: Settings | None = None) -> Iterator[sqlite3.Connection]:
+    """Unit-of-work boundary: commit on success, roll back on failure."""
+    resolved = _resolve(settings)
+    resolved.ensure_dirs()
+    conn = connect(resolved.db_path)
     try:
-        # executescript() implicitly commits, so make sure the schema exists
-        # before any transaction is opened on a fresh database.
-        conn.executescript(SCHEMA)
         yield conn
         conn.commit()
     except Exception:
@@ -240,8 +250,17 @@ def session(db_path: str | Any | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def rows_to_dicts(rows: Sequence[sqlite3.Row]) -> list[dict[str, Any]]:
-    return [dict(row) for row in rows]
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_load(raw: str | None, fallback: Any) -> Any:
+    if not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return fallback
 
 
 # --------------------------------------------------------------------------- #
@@ -250,27 +269,28 @@ def rows_to_dicts(rows: Sequence[sqlite3.Row]) -> list[dict[str, Any]]:
 
 
 def upsert_topic(conn: sqlite3.Connection, query_text: str) -> int:
-    """Return the topic id for this text, creating it if new.
+    """Return the topic id for ``query_text``, creating it if needed.
 
-    Matching is case- and whitespace-insensitive, mirroring the unique index.
+    Matching is case- and whitespace-insensitive via the unique index, so
+    "RAG" and "rag " resolve to the same topic and can accumulate papers.
     """
-    cleaned = " ".join(query_text.split())
+    normalized = " ".join(query_text.split())
     row = conn.execute(
         "SELECT id FROM topics WHERE lower(trim(query_text)) = lower(trim(?))",
-        (cleaned,),
+        (normalized,),
     ).fetchone()
     if row:
         return int(row["id"])
     cur = conn.execute(
         "INSERT INTO topics (query_text, created_at) VALUES (?, ?)",
-        (cleaned, utcnow()),
+        (normalized, utcnow()),
     )
     return int(cur.lastrowid)
 
 
-def fetch_topic_text(conn: sqlite3.Connection, topic_id: int) -> str:
-    row = conn.execute("SELECT query_text FROM topics WHERE id = ?", (topic_id,)).fetchone()
-    return str(row["query_text"]) if row else ""
+def fetch_topic(conn: sqlite3.Connection, topic_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM topics WHERE id = ?", (topic_id,)).fetchone()
+    return dict(row) if row else None
 
 
 # --------------------------------------------------------------------------- #
@@ -279,30 +299,23 @@ def fetch_topic_text(conn: sqlite3.Connection, topic_id: int) -> str:
 
 
 def upsert_papers(conn: sqlite3.Connection, papers: Sequence[Paper]) -> int:
-    """Insert or refresh paper metadata. Returns the number of rows written."""
+    """Insert or refresh paper metadata. Returns the number of new rows.
+
+    Metadata is refreshed on conflict because abstracts are occasionally revised
+    upstream; the extraction cache keys on ``prompt_version`` rather than on the
+    abstract text, so a revised abstract is picked up on the next extraction run
+    only when the prompt version is bumped.
+    """
     if not papers:
         return 0
     now = utcnow()
-    payload = [
-        (
-            p.paper_id,
-            p.version,
-            p.title,
-            p.abstract,
-            _dumps(p.authors),
-            p.published,
-            p.updated,
-            p.primary_category,
-            _dumps(p.categories),
-            p.comment or "",
-            p.journal_ref or "",
-            p.doi or "",
-            p.abs_link,
-            p.pdf_url or "",
-            now,
+    existing = {
+        row["paper_id"]
+        for row in conn.execute(
+            f"SELECT paper_id FROM papers WHERE paper_id IN ({_placeholders(len(papers))})",
+            [p.paper_id for p in papers],
         )
-        for p in papers
-    ]
+    }
     conn.executemany(
         """
         INSERT INTO papers (
@@ -311,59 +324,85 @@ def upsert_papers(conn: sqlite3.Connection, papers: Sequence[Paper]) -> int:
             abs_url, pdf_url, fetched_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(paper_id) DO UPDATE SET
-            version          = excluded.version,
-            title            = excluded.title,
-            abstract         = excluded.abstract,
-            authors_json     = excluded.authors_json,
-            published        = excluded.published,
-            updated          = excluded.updated,
+            version = excluded.version,
+            title = excluded.title,
+            abstract = excluded.abstract,
+            authors_json = excluded.authors_json,
+            published = excluded.published,
+            updated = excluded.updated,
             primary_category = excluded.primary_category,
-            categories_json  = excluded.categories_json,
-            comment          = excluded.comment,
-            journal_ref      = excluded.journal_ref,
-            doi              = excluded.doi,
-            abs_url          = excluded.abs_url,
-            pdf_url          = excluded.pdf_url,
-            fetched_at       = excluded.fetched_at
+            categories_json = excluded.categories_json,
+            comment = excluded.comment,
+            journal_ref = excluded.journal_ref,
+            doi = excluded.doi,
+            abs_url = excluded.abs_url,
+            pdf_url = excluded.pdf_url,
+            fetched_at = excluded.fetched_at
         """,
-        payload,
+        [
+            (
+                p.paper_id,
+                p.version,
+                p.title,
+                p.abstract,
+                _json_dump(p.authors),
+                p.published,
+                p.updated,
+                p.primary_category,
+                _json_dump(p.categories),
+                p.comment,
+                p.journal_ref,
+                p.doi,
+                p.abs_link,
+                p.pdf_url,
+                now,
+            )
+            for p in papers
+        ],
     )
-    return len(payload)
+    return len([p for p in papers if p.paper_id not in existing])
 
 
-def _paper_from_row(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "paper_id": row["paper_id"],
-        "version": row["version"],
-        "title": row["title"],
-        "abstract": row["abstract"],
-        "authors": _loads(row["authors_json"], []),
-        "published": row["published"],
-        "updated": row["updated"],
-        "primary_category": row["primary_category"],
-        "categories": _loads(row["categories_json"], []),
-        "comment": row["comment"],
-        "journal_ref": row["journal_ref"],
-        "doi": row["doi"],
-        "abs_url": row["abs_url"],
-        "pdf_url": row["pdf_url"],
-    }
+def _placeholders(count: int) -> str:
+    return ",".join("?" * count)
 
 
-def fetch_paper(conn: sqlite3.Connection, paper_id: str) -> dict[str, Any] | None:
+def _row_to_paper(row: sqlite3.Row) -> Paper:
+    return Paper(
+        paper_id=row["paper_id"],
+        version=row["version"] or "",
+        title=row["title"],
+        abstract=row["abstract"],
+        authors=_json_load(row["authors_json"], []),
+        published=row["published"] or "",
+        updated=row["updated"] or "",
+        primary_category=row["primary_category"] or "",
+        categories=_json_load(row["categories_json"], []),
+        comment=row["comment"] or "",
+        journal_ref=row["journal_ref"] or "",
+        doi=row["doi"] or "",
+        abs_url=row["abs_url"] or "",
+        pdf_url=row["pdf_url"] or "",
+    )
+
+
+def fetch_paper(conn: sqlite3.Connection, paper_id: str) -> Paper | None:
     row = conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
-    return _paper_from_row(row) if row else None
+    return _row_to_paper(row) if row else None
 
 
-def fetch_papers(conn: sqlite3.Connection, paper_ids: Sequence[str]) -> list[dict[str, Any]]:
+def fetch_papers(conn: sqlite3.Connection, paper_ids: Sequence[str]) -> dict[str, Paper]:
     if not paper_ids:
-        return []
-    placeholders = ",".join("?" * len(paper_ids))
+        return {}
     rows = conn.execute(
-        f"SELECT * FROM papers WHERE paper_id IN ({placeholders})",  # noqa: S608 - placeholder count is fixed
+        f"SELECT * FROM papers WHERE paper_id IN ({_placeholders(len(paper_ids))})",
         list(paper_ids),
-    ).fetchall()
-    return [_paper_from_row(r) for r in rows]
+    )
+    return {row["paper_id"]: _row_to_paper(row) for row in rows}
+
+
+def count_papers(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) AS n FROM papers").fetchone()["n"])
 
 
 # --------------------------------------------------------------------------- #
@@ -371,30 +410,13 @@ def fetch_papers(conn: sqlite3.Connection, paper_ids: Sequence[str]) -> list[dic
 # --------------------------------------------------------------------------- #
 
 
-def upsert_embedding(
-    conn: sqlite3.Connection,
-    paper_id: str,
-    model: str,
-    vector: bytes,
-    dim: int,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO paper_embeddings (paper_id, model, dim, vector, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(paper_id, model) DO UPDATE SET
-            dim = excluded.dim, vector = excluded.vector, created_at = excluded.created_at
-        """,
-        (paper_id, model, dim, vector, utcnow()),
-    )
-
-
 def upsert_embeddings(
     conn: sqlite3.Connection,
     model: str,
-    items: Sequence[tuple[str, bytes, int]],
+    vectors: dict[str, bytes],
 ) -> None:
-    if not items:
+    """Store raw float32 payloads. ``vectors`` maps paper_id -> BLOB bytes."""
+    if not vectors:
         return
     now = utcnow()
     conn.executemany(
@@ -404,31 +426,27 @@ def upsert_embeddings(
         ON CONFLICT(paper_id, model) DO UPDATE SET
             dim = excluded.dim, vector = excluded.vector, created_at = excluded.created_at
         """,
-        [(pid, model, dim, vec, now) for pid, vec, dim in items],
+        [(pid, model, len(blob) // 4, blob, now) for pid, blob in vectors.items()],
     )
 
 
 def fetch_embeddings(
     conn: sqlite3.Connection, model: str, paper_ids: Sequence[str] | None = None
 ) -> dict[str, bytes]:
-    if paper_ids:
-        placeholders = ",".join("?" * len(paper_ids))
+    if paper_ids is None:
         rows = conn.execute(
-            f"SELECT paper_id, vector FROM paper_embeddings WHERE model = ? AND paper_id IN ({placeholders})",  # noqa: S608
-            [model, *paper_ids],
-        ).fetchall()
+            "SELECT paper_id, vector FROM paper_embeddings WHERE model = ? ORDER BY paper_id",
+            (model,),
+        )
     else:
+        if not paper_ids:
+            return {}
         rows = conn.execute(
-            "SELECT paper_id, vector FROM paper_embeddings WHERE model = ?", (model,)
-        ).fetchall()
-    return {row["paper_id"]: row["vector"] for row in rows}
-
-
-def count_embeddings(conn: sqlite3.Connection, model: str) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM paper_embeddings WHERE model = ?", (model,)
-    ).fetchone()
-    return int(row["n"]) if row else 0
+            f"SELECT paper_id, vector FROM paper_embeddings WHERE model = ? "
+            f"AND paper_id IN ({_placeholders(len(paper_ids))})",
+            (model, *paper_ids),
+        )
+    return {row["paper_id"]: bytes(row["vector"]) for row in rows}
 
 
 # --------------------------------------------------------------------------- #
@@ -437,10 +455,7 @@ def count_embeddings(conn: sqlite3.Connection, model: str) -> int:
 
 
 def insert_landscape(
-    conn: sqlite3.Connection,
-    topic_id: int,
-    title: str,
-    params: dict[str, Any] | None = None,
+    conn: sqlite3.Connection, *, topic_id: int, title: str, params: dict[str, Any] | None = None
 ) -> int:
     now = utcnow()
     cur = conn.execute(
@@ -449,12 +464,12 @@ def insert_landscape(
                                 generation, created_at, updated_at)
         VALUES (?, ?, '', 'running', ?, 1, ?, ?)
         """,
-        (topic_id, title, _dumps(params or {}), now, now),
+        (topic_id, title, _json_dump(params or {}), now, now),
     )
     return int(cur.lastrowid)
 
 
-def fetch_landscape_row(conn: sqlite3.Connection, landscape_id: int) -> dict[str, Any] | None:
+def fetch_landscape(conn: sqlite3.Connection, landscape_id: int) -> dict[str, Any] | None:
     row = conn.execute(
         """
         SELECT l.*, t.query_text AS topic
@@ -463,175 +478,170 @@ def fetch_landscape_row(conn: sqlite3.Connection, landscape_id: int) -> dict[str
         """,
         (landscape_id,),
     ).fetchone()
-    if not row:
-        return None
-    data = dict(row)
-    data["params"] = _loads(data.pop("params_json", "{}"), {})
-    return data
+    return dict(row) if row else None
+
+
+def find_landscape_for_topic(conn: sqlite3.Connection, topic_id: int) -> dict[str, Any] | None:
+    """Most recent landscape for a topic, used by ``expand`` and by re-runs."""
+    row = conn.execute(
+        """
+        SELECT l.*, t.query_text AS topic
+        FROM landscapes l JOIN topics t ON t.id = l.topic_id
+        WHERE l.topic_id = ?
+        ORDER BY l.generation DESC, l.id DESC
+        LIMIT 1
+        """,
+        (topic_id,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def list_landscapes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT l.id, l.title, l.summary, l.status, l.generation,
-               l.created_at, l.updated_at, t.query_text AS topic,
+        SELECT l.*, t.query_text AS topic,
                (SELECT COUNT(*) FROM landscape_papers lp WHERE lp.landscape_id = l.id) AS paper_count,
                (SELECT COUNT(*) FROM clusters c
-                 WHERE c.landscape_id = l.id AND c.local_label >= 0) AS cluster_count
+                 WHERE c.landscape_id = l.id AND c.local_label != ?) AS cluster_count
         FROM landscapes l JOIN topics t ON t.id = l.topic_id
         ORDER BY l.updated_at DESC, l.id DESC
-        """
-    ).fetchall()
-    return rows_to_dicts(rows)
+        """,
+        (UNCLUSTERED_LABEL,),
+    )
+    return [dict(row) for row in rows]
 
 
-def set_landscape_status(
+def update_landscape(
     conn: sqlite3.Connection,
     landscape_id: int,
-    status: str,
     *,
-    error: str | None = None,
+    title: str | None = None,
+    summary: str | None = None,
+    status: str | None = None,
 ) -> None:
-    if error is not None:
-        conn.execute(
-            "UPDATE landscapes SET status = ?, summary = ?, updated_at = ? WHERE id = ?",
-            (status, error, utcnow(), landscape_id),
-        )
-        return
-    conn.execute(
-        "UPDATE landscapes SET status = ?, updated_at = ? WHERE id = ?",
-        (status, utcnow(), landscape_id),
-    )
-
-
-def update_landscape_meta(
-    conn: sqlite3.Connection, landscape_id: int, *, title: str, summary: str
-) -> None:
-    conn.execute(
-        "UPDATE landscapes SET title = ?, summary = ?, updated_at = ? WHERE id = ?",
-        (title, summary, utcnow(), landscape_id),
-    )
+    sets: list[str] = ["updated_at = ?"]
+    params: list[Any] = [utcnow()]
+    if title is not None:
+        sets.append("title = ?")
+        params.append(title)
+    if summary is not None:
+        sets.append("summary = ?")
+        params.append(summary)
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+    params.append(landscape_id)
+    conn.execute(f"UPDATE landscapes SET {', '.join(sets)} WHERE id = ?", params)
 
 
 def bump_generation(conn: sqlite3.Connection, landscape_id: int) -> int:
-    """Increment and return the new generation.
-
-    Positions are always recomputed from scratch (never ``umap.transform()``ed),
-    so the generation is what the UI uses to detect that the layout moved.
-    """
     conn.execute(
         "UPDATE landscapes SET generation = generation + 1, updated_at = ? WHERE id = ?",
         (utcnow(), landscape_id),
     )
-    row = conn.execute(
-        "SELECT generation FROM landscapes WHERE id = ?", (landscape_id,)
-    ).fetchone()
+    row = conn.execute("SELECT generation FROM landscapes WHERE id = ?", (landscape_id,)).fetchone()
     return int(row["generation"]) if row else 1
 
 
-def delete_landscape(conn: sqlite3.Connection, landscape_id: int) -> bool:
-    cur = conn.execute("DELETE FROM landscapes WHERE id = ?", (landscape_id,))
-    return cur.rowcount > 0
+def delete_landscape(conn: sqlite3.Connection, landscape_id: int) -> None:
+    conn.execute("DELETE FROM landscapes WHERE id = ?", (landscape_id,))
 
 
 # --------------------------------------------------------------------------- #
-# Landscape <-> paper links
+# Landscape membership and layout
 # --------------------------------------------------------------------------- #
 
 
-def link_papers(conn: sqlite3.Connection, landscape_id: int, ranked: Sequence[Any]) -> int:
-    """Attach ranked papers to a landscape.
-
-    ``INSERT OR IGNORE`` is deliberate: growing a landscape must never reset the
-    ``added_at`` or the layout of a paper that is already on the map.
-    """
-    if not ranked:
-        return 0
-    now = utcnow()
-    conn.executemany(
+def link_paper(
+    conn: sqlite3.Connection,
+    landscape_id: int,
+    *,
+    paper_id: str,
+    rank: int,
+    relevance_score: float,
+    rerank_source: str,
+    rationale: str = "",
+    is_seed: bool = False,
+) -> None:
+    """Attach a paper to a landscape, preserving any existing x/y position."""
+    conn.execute(
         """
-        INSERT OR IGNORE INTO landscape_papers (
-            landscape_id, paper_id, rank, relevance_score, rerank_source,
-            rationale, is_seed, cluster_id, x, y, added_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+        INSERT INTO landscape_papers (landscape_id, paper_id, rank, relevance_score,
+                                      rerank_source, rationale, is_seed, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(landscape_id, paper_id) DO UPDATE SET
+            rank = excluded.rank,
+            relevance_score = excluded.relevance_score,
+            rerank_source = excluded.rerank_source,
+            rationale = excluded.rationale,
+            is_seed = excluded.is_seed
         """,
-        [
-            (
-                landscape_id,
-                item.paper.paper_id,
-                item.rank,
-                item.relevance_score,
-                item.rerank_source,
-                item.rationale,
-                1 if item.rank <= 10 else 0,
-                now,
-            )
-            for item in ranked
-        ],
+        (
+            landscape_id,
+            paper_id,
+            rank,
+            relevance_score,
+            rerank_source,
+            rationale,
+            1 if is_seed else 0,
+            utcnow(),
+        ),
     )
-    return len(ranked)
 
 
-def fetch_landscape_papers(
-    conn: sqlite3.Connection, landscape_id: int
-) -> list[dict[str, Any]]:
-    """Papers on the map, joined with their paper metadata, ordered by rank."""
+def fetch_landscape_papers(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT lp.rank, lp.relevance_score, lp.rerank_source, lp.rationale,
-               lp.is_seed, lp.cluster_id, lp.x, lp.y, p.*
-        FROM landscape_papers lp
-        JOIN papers p ON p.paper_id = lp.paper_id
+               lp.is_seed, lp.cluster_id, lp.x, lp.y, lp.added_at,
+               p.paper_id, p.version, p.title, p.abstract, p.authors_json,
+               p.published, p.primary_category, p.categories_json, p.abs_url, p.pdf_url
+        FROM landscape_papers lp JOIN papers p ON p.paper_id = lp.paper_id
         WHERE lp.landscape_id = ?
-        ORDER BY lp.rank ASC, lp.paper_id ASC
+        ORDER BY lp.rank ASC, p.paper_id ASC
         """,
         (landscape_id,),
-    ).fetchall()
+    )
     out: list[dict[str, Any]] = []
     for row in rows:
-        data = _paper_from_row(row)
-        data.update(
-            rank=int(row["rank"]),
-            relevance_score=float(row["relevance_score"]),
-            rerank_source=row["rerank_source"],
-            rationale=row["rationale"],
-            is_seed=bool(row["is_seed"]),
-            cluster_id=row["cluster_id"],
-            x=row["x"],
-            y=row["y"],
-        )
-        out.append(data)
+        item = dict(row)
+        item["authors"] = _json_load(item.pop("authors_json"), [])
+        item["categories"] = _json_load(item.pop("categories_json"), [])
+        item["is_seed"] = bool(item["is_seed"])
+        out.append(item)
     return out
 
 
-def existing_paper_ids(conn: sqlite3.Connection, landscape_id: int) -> set[str]:
+def landscape_paper_ids(conn: sqlite3.Connection, landscape_id: int) -> set[str]:
     rows = conn.execute(
         "SELECT paper_id FROM landscape_papers WHERE landscape_id = ?", (landscape_id,)
-    ).fetchall()
-    return {str(r["paper_id"]) for r in rows}
+    )
+    return {row["paper_id"] for row in rows}
 
 
-def update_paper_layout(
+def update_layout(
     conn: sqlite3.Connection,
     landscape_id: int,
-    entries: Sequence[tuple[str, int | None, float, float]],
+    layout: dict[str, tuple[float, float, int]],
 ) -> None:
-    """Write cluster assignment and 2D coordinates for each paper."""
-    if not entries:
+    """Persist coordinates and cluster assignment: paper_id -> (x, y, cluster)."""
+    if not layout:
         return
     conn.executemany(
-        "UPDATE landscape_papers SET cluster_id = ?, x = ?, y = ? "
+        "UPDATE landscape_papers SET x = ?, y = ?, cluster_id = ? "
         "WHERE landscape_id = ? AND paper_id = ?",
-        [(cluster_id, x, y, landscape_id, paper_id) for paper_id, cluster_id, x, y in entries],
+        [(x, y, cluster, landscape_id, pid) for pid, (x, y, cluster) in layout.items()],
     )
 
 
 # --------------------------------------------------------------------------- #
-# Clusters, edges, tensions, open problems, reading path
+# Clusters
 # --------------------------------------------------------------------------- #
 
 
-def replace_clusters(conn: sqlite3.Connection, landscape_id: int, clusters: Sequence[dict[str, Any]]) -> None:
+def replace_clusters(
+    conn: sqlite3.Connection, landscape_id: int, clusters: Sequence[dict[str, Any]]
+) -> None:
     conn.execute("DELETE FROM clusters WHERE landscape_id = ?", (landscape_id,))
     if not clusters:
         return
@@ -648,8 +658,8 @@ def replace_clusters(conn: sqlite3.Connection, landscape_id: int, clusters: Sequ
                 c.get("label", ""),
                 c.get("description", ""),
                 int(c.get("paper_count", 0)),
-                c.get("x"),
-                c.get("y"),
+                float(c.get("x", 0.0)),
+                float(c.get("y", 0.0)),
                 c.get("color", "#94a3b8"),
             )
             for c in clusters
@@ -661,11 +671,24 @@ def fetch_clusters(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str
     rows = conn.execute(
         "SELECT * FROM clusters WHERE landscape_id = ? ORDER BY local_label ASC",
         (landscape_id,),
-    ).fetchall()
-    return rows_to_dicts(rows)
+    )
+    return [dict(row) for row in rows]
 
 
-def replace_edges(conn: sqlite3.Connection, landscape_id: int, edges: Sequence[dict[str, Any]]) -> None:
+def cluster_id_by_label(conn: sqlite3.Connection, landscape_id: int) -> dict[int, int]:
+    """Map HDBSCAN's local label (-1, 0, 1, ...) to the clusters table row id."""
+    rows = conn.execute(
+        "SELECT id, local_label FROM clusters WHERE landscape_id = ?", (landscape_id,)
+    )
+    return {int(row["local_label"]): int(row["id"]) for row in rows}
+
+
+# --------------------------------------------------------------------------- #
+# Edges, tensions, open problems, reading path
+# --------------------------------------------------------------------------- #
+
+
+def replace_edges(conn: sqlite3.Connection, landscape_id: int, edges: Sequence[EdgeClaim]) -> None:
     conn.execute("DELETE FROM edges WHERE landscape_id = ?", (landscape_id,))
     if not edges:
         return
@@ -675,14 +698,7 @@ def replace_edges(conn: sqlite3.Connection, landscape_id: int, edges: Sequence[d
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         [
-            (
-                landscape_id,
-                e["src_paper_id"],
-                e["dst_paper_id"],
-                e["kind"],
-                float(e.get("weight", 0.5)),
-                e.get("rationale", ""),
-            )
+            (landscape_id, e.src_paper_id, e.dst_paper_id, e.kind, float(e.weight), e.rationale)
             for e in edges
         ],
     )
@@ -690,22 +706,20 @@ def replace_edges(conn: sqlite3.Connection, landscape_id: int, edges: Sequence[d
 
 def fetch_edges(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT src_paper_id, dst_paper_id, kind, weight, rationale FROM edges WHERE landscape_id = ?",
+        "SELECT src_paper_id, dst_paper_id, kind, weight, rationale FROM edges "
+        "WHERE landscape_id = ? ORDER BY id ASC",
         (landscape_id,),
-    ).fetchall()
-    return rows_to_dicts(rows)
+    )
+    return [dict(row) for row in rows]
 
 
-def replace_tensions(conn: sqlite3.Connection, landscape_id: int, tensions: Sequence[dict[str, Any]]) -> None:
+def replace_tensions(conn: sqlite3.Connection, landscape_id: int, tensions: Sequence[Tension]) -> None:
     conn.execute("DELETE FROM tensions WHERE landscape_id = ?", (landscape_id,))
     if not tensions:
         return
     conn.executemany(
         "INSERT INTO tensions (landscape_id, statement, paper_a_id, paper_b_id) VALUES (?, ?, ?, ?)",
-        [
-            (landscape_id, t["statement"], t.get("paper_a_id", ""), t.get("paper_b_id", ""))
-            for t in tensions
-        ],
+        [(landscape_id, t.statement, t.paper_a_id, t.paper_b_id) for t in tensions],
     )
 
 
@@ -713,56 +727,46 @@ def fetch_tensions(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str
     rows = conn.execute(
         "SELECT statement, paper_a_id, paper_b_id FROM tensions WHERE landscape_id = ? ORDER BY id ASC",
         (landscape_id,),
-    ).fetchall()
-    return rows_to_dicts(rows)
+    )
+    return [dict(row) for row in rows]
 
 
 def replace_open_problems(
-    conn: sqlite3.Connection, landscape_id: int, problems: Sequence[dict[str, Any]]
+    conn: sqlite3.Connection, landscape_id: int, problems: Sequence[OpenProblem]
 ) -> None:
     conn.execute("DELETE FROM open_problems WHERE landscape_id = ?", (landscape_id,))
     if not problems:
         return
     conn.executemany(
-        """
-        INSERT INTO open_problems (landscape_id, statement, why_open, supporting_json)
-        VALUES (?, ?, ?, ?)
-        """,
-        [
-            (
-                landscape_id,
-                p["statement"],
-                p.get("why_open", ""),
-                _dumps(p.get("supporting_paper_ids", [])),
-            )
-            for p in problems
-        ],
+        "INSERT INTO open_problems (landscape_id, statement, why_open, supporting_json) "
+        "VALUES (?, ?, ?, ?)",
+        [(landscape_id, p.statement, p.why_open, _json_dump(p.supporting_paper_ids)) for p in problems],
     )
 
 
 def fetch_open_problems(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT statement, why_open, supporting_json FROM open_problems WHERE landscape_id = ? ORDER BY id ASC",
+        "SELECT statement, why_open, supporting_json FROM open_problems "
+        "WHERE landscape_id = ? ORDER BY id ASC",
         (landscape_id,),
-    ).fetchall()
-    out: list[dict[str, Any]] = []
+    )
+    out = []
     for row in rows:
-        data = dict(row)
-        data["supporting_paper_ids"] = _loads(data.pop("supporting_json", "[]"), [])
-        out.append(data)
+        item = dict(row)
+        item["supporting_paper_ids"] = _json_load(item.pop("supporting_json"), [])
+        out.append(item)
     return out
 
 
-def replace_reading_path(conn: sqlite3.Connection, landscape_id: int, steps: Sequence[dict[str, Any]]) -> None:
+def replace_reading_path(
+    conn: sqlite3.Connection, landscape_id: int, steps: Sequence[ReadingStep]
+) -> None:
     conn.execute("DELETE FROM reading_path WHERE landscape_id = ?", (landscape_id,))
     if not steps:
         return
     conn.executemany(
         "INSERT INTO reading_path (landscape_id, paper_id, position, why) VALUES (?, ?, ?, ?)",
-        [
-            (landscape_id, s["paper_id"], int(s["position"]), s.get("why", ""))
-            for s in steps
-        ],
+        [(landscape_id, s.paper_id, int(s.position), s.why) for s in steps],
     )
 
 
@@ -770,14 +774,24 @@ def fetch_reading_path(conn: sqlite3.Connection, landscape_id: int) -> list[dict
     rows = conn.execute(
         """
         SELECT rp.paper_id, rp.position, rp.why, p.title
-        FROM reading_path rp
-        LEFT JOIN papers p ON p.paper_id = rp.paper_id
+        FROM reading_path rp LEFT JOIN papers p ON p.paper_id = rp.paper_id
         WHERE rp.landscape_id = ?
         ORDER BY rp.position ASC
         """,
         (landscape_id,),
-    ).fetchall()
-    return rows_to_dicts(rows)
+    )
+    return [dict(row) for row in rows]
+
+
+def replace_cluster_labels(
+    conn: sqlite3.Connection, landscape_id: int, labels: Sequence[ClusterLabel]
+) -> None:
+    """Apply LLM labels onto rows already written by the layout stage."""
+    for label in labels:
+        conn.execute(
+            "UPDATE clusters SET label = ?, description = ? WHERE landscape_id = ? AND local_label = ?",
+            (label.label, label.description, landscape_id, int(label.local_label)),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -789,8 +803,9 @@ def upsert_extraction(
     conn: sqlite3.Connection,
     paper_id: str,
     prompt_version: str,
-    model: str,
     extraction: PaperExtraction,
+    *,
+    model: str = "",
 ) -> None:
     conn.execute(
         """
@@ -822,27 +837,27 @@ def upsert_extraction(
             extraction.results,
             extraction.contribution,
             extraction.limitations,
-            _dumps(extraction.datasets),
-            _dumps(extraction.metrics),
+            _json_dump(extraction.datasets),
+            _json_dump(extraction.metrics),
             extraction.novelty,
-            _dumps(extraction.evidence),
+            _json_dump(extraction.evidence),
             extraction.confidence,
             utcnow(),
         ),
     )
 
 
-def _extraction_from_row(row: sqlite3.Row) -> PaperExtraction:
+def _row_to_extraction(row: sqlite3.Row) -> PaperExtraction:
     return PaperExtraction(
         problem=row["problem"],
         method=row["method"],
         results=row["results"],
         contribution=row["contribution"],
         limitations=row["limitations"],
-        datasets=_loads(row["datasets_json"], []),
-        metrics=_loads(row["metrics_json"], []),
+        datasets=_json_load(row["datasets_json"], []),
+        metrics=_json_load(row["metrics_json"], []),
         novelty=row["novelty"] or "unclear",
-        evidence=_loads(row["evidence_json"], {}),
+        evidence=_json_load(row["evidence_json"], {}),
         confidence=row["confidence"],
     )
 
@@ -854,77 +869,103 @@ def fetch_extraction(
         "SELECT * FROM paper_extractions WHERE paper_id = ? AND prompt_version = ?",
         (paper_id, prompt_version),
     ).fetchone()
-    return _extraction_from_row(row) if row else None
+    return _row_to_extraction(row) if row else None
 
 
 def fetch_extractions(
-    conn: sqlite3.Connection, prompt_version: str, paper_ids: Sequence[str]
+    conn: sqlite3.Connection, paper_ids: Sequence[str], prompt_version: str
 ) -> dict[str, PaperExtraction]:
     if not paper_ids:
         return {}
-    placeholders = ",".join("?" * len(paper_ids))
     rows = conn.execute(
-        f"SELECT * FROM paper_extractions WHERE prompt_version = ? AND paper_id IN ({placeholders})",  # noqa: S608
-        [prompt_version, *paper_ids],
-    ).fetchall()
-    return {row["paper_id"]: _extraction_from_row(row) for row in rows}
-
-
-def count_extractions(conn: sqlite3.Connection, prompt_version: str) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM paper_extractions WHERE prompt_version = ?",
-        (prompt_version,),
-    ).fetchone()
-    return int(row["n"]) if row else 0
+        f"SELECT * FROM paper_extractions WHERE prompt_version = ? "
+        f"AND paper_id IN ({_placeholders(len(paper_ids))})",
+        (prompt_version, *paper_ids),
+    )
+    return {row["paper_id"]: _row_to_extraction(row) for row in rows}
 
 
 # --------------------------------------------------------------------------- #
-# Run log
+# Runs (SSE replay)
 # --------------------------------------------------------------------------- #
 
 
-def insert_run(
-    conn: sqlite3.Connection,
-    run_id: str,
-    landscape_id: int | None,
-    stage: str,
-    status: str,
-    message: str = "",
-    payload: dict[str, Any] | None = None,
-) -> None:
+def insert_run(conn: sqlite3.Connection, event_payload: dict[str, Any]) -> None:
+    """Record a stage event so a client that reconnects can replay progress."""
     conn.execute(
         """
-        INSERT INTO runs (id, landscape_id, stage, status, message, payload_json, created_at)
+        INSERT OR REPLACE INTO runs (id, landscape_id, stage, status, message, payload_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            status = excluded.status, message = excluded.message,
-            payload_json = excluded.payload_json
         """,
-        (run_id, landscape_id, stage, status, message, _dumps(payload or {}), utcnow()),
+        (
+            event_payload["id"],
+            event_payload.get("landscape_id"),
+            event_payload["stage"],
+            event_payload["status"],
+            event_payload.get("message", ""),
+            _json_dump(event_payload.get("payload", {})),
+            event_payload.get("created_at") or utcnow(),
+        ),
     )
 
 
 def fetch_runs(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM runs WHERE landscape_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM runs WHERE landscape_id = ? ORDER BY created_at ASC, id ASC",
         (landscape_id,),
-    ).fetchall()
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        data = dict(row)
-        data["payload"] = _loads(data.pop("payload_json", "{}"), {})
-        out.append(data)
-    return out
+    )
+    return [dict(row) for row in rows]
 
 
-# --------------------------------------------------------------------------- #
-# Convenience
-# --------------------------------------------------------------------------- #
+def default_settings() -> Settings:
+    """Convenience for scripts that only need paths, not credentials."""
+    settings = Settings.from_env()
+    settings.ensure_dirs()
+    return settings
 
 
-def default_db_path() -> Any:
-    return PROJECT_ROOT / "data/landscapes.db"
-
-
-def settings_db_path(settings: Settings) -> Any:
-    return settings.db_path
+__all__ = [
+    "PROJECT_ROOT",
+    "SCHEMA",
+    "StoreError",
+    "bump_generation",
+    "cluster_id_by_label",
+    "connect",
+    "count_papers",
+    "default_settings",
+    "delete_landscape",
+    "fetch_clusters",
+    "fetch_edges",
+    "fetch_embeddings",
+    "fetch_extraction",
+    "fetch_extractions",
+    "fetch_landscape",
+    "fetch_landscape_papers",
+    "fetch_open_problems",
+    "fetch_paper",
+    "fetch_papers",
+    "fetch_reading_path",
+    "fetch_runs",
+    "fetch_tensions",
+    "fetch_topic",
+    "find_landscape_for_topic",
+    "init_db",
+    "insert_landscape",
+    "insert_run",
+    "landscape_paper_ids",
+    "link_paper",
+    "list_landscapes",
+    "replace_cluster_labels",
+    "replace_clusters",
+    "replace_edges",
+    "replace_open_problems",
+    "replace_reading_path",
+    "replace_tensions",
+    "session",
+    "update_landscape",
+    "update_layout",
+    "upsert_embeddings",
+    "upsert_extraction",
+    "upsert_papers",
+    "upsert_topic",
+]

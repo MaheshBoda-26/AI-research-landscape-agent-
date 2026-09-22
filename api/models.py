@@ -102,11 +102,21 @@ class arXivQuery(BaseModel):
 
 
 class RankedPaper(BaseModel):
-    """A paper with its rerank verdict attached."""
+    """A paper with its rerank verdict attached.
+
+    Two relevance numbers are carried on purpose. ``relevance_score`` is the
+    absolute, calibrated 0-10 value you can threshold on. ``cross_encoder_logit``
+    is the raw model output, which is what actually resolves *ordering* among
+    candidates: for a pre-filtered candidate set the calibrated score saturates
+    near 10 for almost everything, while the logits still spread over a range of
+    several points.
+    """
 
     paper: Paper
     relevance_score: float = Field(ge=0.0, le=10.0)
     cross_encoder_score: float | None = None
+    cross_encoder_logit: float | None = None
+    relative_score: float | None = Field(default=None, ge=0.0, le=10.0)
     llm_score: float | None = None
     rerank_source: Literal["cross-encoder", "llm", "blend", "fusion-fallback"] = "cross-encoder"
     rank: int = 0
@@ -146,6 +156,24 @@ class PaperExtraction(BaseModel):
     @classmethod
     def _coerce_none(cls, value: object) -> object:
         return [] if value is None else value
+
+
+class JudgeScore(BaseModel):
+    """One paper's relevance verdict from the LLM judge."""
+
+    id: int
+    score: float = Field(ge=0.0, le=10.0)
+    reason: str = ""
+
+
+class JudgeBatch(BaseModel):
+    """The judge's response envelope.
+
+    An object containing an array rather than a bare array, so the response
+    validates against a Pydantic model like every other LLM call in the project.
+    """
+
+    scores: list[JudgeScore] = Field(default_factory=list)
 
 
 class ClusterLabel(BaseModel):
@@ -247,6 +275,10 @@ class PaperInLandscape(BaseModel):
     pdf_url: str = ""
     rank: int
     relevance_score: float
+    cross_encoder_logit: float | None = None
+    #: Percentile rank within this landscape, 0-10. RELATIVE, unlike
+    #: ``relevance_score``, and only meaningful for display and sizing.
+    relative_score: float | None = None
     rerank_source: str
     cluster_id: int | None = None
     x: float = 0.0

@@ -197,6 +197,20 @@ class Settings:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.retrieval_cache_dir.mkdir(parents=True, exist_ok=True)
         self.model_profile_dir.mkdir(parents=True, exist_ok=True)
+        self.apply_model_cache_env()
+
+    def apply_model_cache_env(self) -> None:
+        """Point HuggingFace at ``data/models`` before any model is imported.
+
+        Without this, the cross-encoder and embedding weights land in the user's
+        global ``~/.cache/huggingface``, which makes the project's footprint
+        invisible and awkward to clean up. ``setdefault`` so an explicit
+        environment setting still wins.
+        """
+        os.environ.setdefault("HF_HOME", str(self.model_profile_dir))
+        os.environ.setdefault(
+            "SENTENCE_TRANSFORMERS_HOME", str(self.model_profile_dir / "sentence_transformers")
+        )
 
     def validate(self, *, require_llm: bool = True) -> None:
         """Fail early and name the missing variable.

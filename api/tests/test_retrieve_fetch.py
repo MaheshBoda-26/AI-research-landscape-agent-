@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 
 import pytest
+from fake_arxiv import fake_client, fixture_bytes
 
 from config import Settings
-from fake_arxiv import fake_client, fixture_bytes
 from pipeline.retrieve import (
     RetrievalError,
     cache_key,
