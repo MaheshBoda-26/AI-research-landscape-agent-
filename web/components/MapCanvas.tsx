@@ -13,20 +13,28 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-import { ClusterLabelNode, PaperNode, type PaperFlowNode } from "@/components/PaperNode";
+import {
+  ClusterLabelNode,
+  PaperNode,
+  type PaperFlowNode,
+} from "@/components/PaperNode";
 import { EDGE_LABELS, type EdgeKind, type LandscapeDetail } from "@/lib/types";
 
 /** UMAP output is roughly unit-scale; this maps it onto readable pixel space. */
 const SCALE = 460;
-const UNCLUSTERED_COLOR = "#7b88a3";
 
+/**
+ * Relationship colors. All drawn from the map hue family plus the two semantic
+ * exceptions (danger = contradiction, muted = shared method), so the canvas
+ * never reads as a rainbow. Contradiction keeps the dashed treatment.
+ */
 const EDGE_COLORS: Record<EdgeKind, string> = {
-  builds_on: "#5eead4",
-  improves: "#6ea8fe",
-  compares_against: "#a78bfa",
-  contradicts: "#f87171",
-  shares_method: "#9ca3af",
-  applies: "#fbbf24",
+  builds_on: "var(--color-hue-1)",
+  improves: "var(--color-hue-2)",
+  compares_against: "var(--color-hue-3)",
+  contradicts: "var(--color-danger)",
+  shares_method: "var(--color-muted)",
+  applies: "var(--color-hue-4)",
 };
 
 const nodeTypes = { paper: PaperNode, cluster: ClusterLabelNode };
@@ -56,7 +64,7 @@ export function MapCanvas({
   );
 
   const nodes = useMemo<FlowNode[]>(() => {
-    const paperNodes: FlowNode[] = landscape.papers.map((paper) => {
+    const paperNodes: FlowNode[] = landscape.papers.map((paper, index) => {
       const cluster =
         paper.cluster_id !== null ? clusterById.get(paper.cluster_id) : undefined;
       return {
@@ -65,11 +73,11 @@ export function MapCanvas({
         position: { x: paper.x * SCALE, y: paper.y * SCALE },
         data: {
           paper,
-          color: cluster?.is_unclustered
-            ? UNCLUSTERED_COLOR
-            : (cluster?.color ?? UNCLUSTERED_COLOR),
+          color: cluster?.color ?? "var(--color-unclustered)",
           selected: paper.paper_id === selectedPaperId,
           pathPosition: pathPositions.get(paper.paper_id) ?? null,
+          // Stagger index for the one-shot entrance animation.
+          index,
           onSelect: onSelectPaper,
         },
       };
@@ -84,7 +92,9 @@ export function MapCanvas({
       data: {
         label: cluster.label,
         count: cluster.paper_count,
-        color: cluster.is_unclustered ? UNCLUSTERED_COLOR : cluster.color,
+        color: cluster.is_unclustered
+          ? "var(--color-unclustered)"
+          : cluster.color,
       },
       selectable: false,
       draggable: false,
@@ -92,7 +102,14 @@ export function MapCanvas({
     }));
 
     return [...labelNodes, ...paperNodes];
-  }, [landscape.papers, landscape.clusters, clusterById, pathPositions, selectedPaperId, onSelectPaper]);
+  }, [
+    landscape.papers,
+    landscape.clusters,
+    clusterById,
+    pathPositions,
+    selectedPaperId,
+    onSelectPaper,
+  ]);
 
   const edges = useMemo<FlowEdge[]>(() => {
     if (!showEdges) return [];
@@ -102,7 +119,7 @@ export function MapCanvas({
       target: edge.dst_paper_id,
       label: edge.rationale ? undefined : EDGE_LABELS[edge.kind],
       style: {
-        stroke: EDGE_COLORS[edge.kind] ?? "#64748b",
+        stroke: EDGE_COLORS[edge.kind] ?? "var(--color-muted)",
         strokeWidth: 1 + edge.weight,
         // A contradiction is the one relationship worth spotting from a
         // distance, so it is the only dashed edge kind.
@@ -132,7 +149,12 @@ export function MapCanvas({
         proOptions={{ hideAttribution: false }}
         className="bg-[var(--color-canvas)]"
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#1e2942" />
+        <Background
+          variant={BackgroundVariant.Dots}
+          gap={22}
+          size={1}
+          color="var(--color-dots)"
+        />
         <Controls showInteractive={false} />
         <MiniMap
           pannable
@@ -140,25 +162,26 @@ export function MapCanvas({
           nodeColor={(node) =>
             node.type === "cluster"
               ? "transparent"
-              : ((node.data as { color?: string })?.color ?? "#64748b")
+              : ((node.data as { color?: string })?.color ?? "var(--color-muted)")
           }
-          maskColor="rgb(11 16 32 / 70%)"
-          className="!bg-[var(--color-panel)]"
+          maskColor="oklch(0.145 0.012 180 / 0.7)"
         />
       </ReactFlow>
 
-      <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-2">
-        <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-[var(--color-edge)] bg-[var(--color-panel)]/90 px-3 py-1.5 text-[11px] backdrop-blur">
-          <span className="text-[var(--color-muted)]">
-            {landscape.papers.length} papers · {landscape.clusters.filter((c) => !c.is_unclustered).length} clusters
-          </span>
+      <div className="pointer-events-none absolute left-3 top-3">
+        <div className="pointer-events-auto flex items-center gap-2 rounded-[var(--radius-md)] border border-[var(--color-edge)] bg-[var(--color-panel)]/90 px-3 py-1.5 text-xs text-[var(--color-muted)] backdrop-blur">
           <button
             type="button"
+            aria-pressed={showEdges}
             onClick={() => setShowEdges((value) => !value)}
-            className="rounded border border-[var(--color-edge)] px-1.5 py-0.5 text-[10px] text-[var(--color-muted)] hover:text-[var(--color-ink)]"
+            className="focus-ring cursor-pointer rounded-[var(--radius-sm)] px-1 py-0.5 text-[var(--color-ink-secondary)] transition-colors hover:text-[var(--color-ink)]"
           >
-            {showEdges ? "hide links" : "show links"}
+            {showEdges ? "Hide links" : "Show links"}
           </button>
+          <span aria-hidden="true" className="text-[var(--color-edge-strong)]">
+            |
+          </span>
+          <span className="tabular-nums">{landscape.papers.length} papers</span>
         </div>
       </div>
     </div>

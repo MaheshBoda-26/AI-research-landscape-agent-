@@ -28,7 +28,9 @@ export default function HomePage() {
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") return;
       setError(
-        cause instanceof Error ? cause.message : "Could not reach the API.",
+        cause instanceof Error
+          ? `Could not reach the API: ${cause.message}`
+          : "Could not reach the API.",
       );
     }
   }, []);
@@ -49,35 +51,36 @@ export default function HomePage() {
 
   if (topic) {
     return (
-      <RunView
-        topic={topic}
-        active
-        onFinished={(id) => router.push(`/landscape/${id}`)}
-      />
+      <main className="app-main">
+        <RunView
+          topic={topic}
+          active
+          onFinished={(id) => router.push(`/landscape/${id}`)}
+          onCancel={() => setTopic(null)}
+        />
+      </main>
     );
   }
 
   return (
-    <main className="mx-auto w-full max-w-3xl px-6 py-14">
-      <div className="mb-10 text-center">
-        <h1 className="text-3xl font-semibold tracking-tight">
-          What do you want to understand?
-        </h1>
-        <p className="mx-auto mt-3 max-w-xl text-sm text-[var(--color-muted)]">
+    <main className="app-main mx-auto w-full max-w-3xl px-6 py-16">
+      <div className="mb-12 text-center">
+        <h1>What do you want to understand?</h1>
+        <p className="mx-auto mt-4 max-w-xl text-[15px] leading-relaxed text-[var(--color-ink-secondary)]">
           Enter an ML topic in plain English. arXiv supplies the candidates, the
-          model reads and ranks them, and you get a map of the area rather than a
-          list of papers.
+          model reads and ranks them, and you get a map of the area rather than
+          a list of papers.
         </p>
       </div>
 
       <TopicForm onSubmit={setTopic} />
 
       {health && !health.llm_configured && (
-        <div className="mt-8 rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3">
-          <p className="text-xs font-medium text-amber-300">
+        <div className="mt-10 rounded-[var(--radius-lg)] border border-[var(--color-warning)]/30 bg-[var(--color-warning-dim)] px-4 py-3">
+          <p className="text-xs font-medium text-[var(--color-warning)]">
             No LLM API key is configured.
           </p>
-          <p className="mt-1 text-xs text-[var(--color-muted)]">
+          <p className="mt-1 text-xs leading-relaxed text-[var(--color-ink-secondary)]">
             Retrieval, reranking, and the layout still work — you will get real
             papers positioned by real embedding structure. But without a key
             there are no extractions, no cluster names, and no synthesis. Set{" "}
@@ -89,13 +92,16 @@ export default function HomePage() {
       )}
 
       {error && (
-        <div className="mt-8 rounded-xl border border-red-500/30 bg-red-500/5 px-4 py-3 text-xs text-red-300">
+        <div
+          role="alert"
+          className="mt-10 rounded-[var(--radius-lg)] border border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)] px-4 py-3 text-xs leading-relaxed text-[var(--color-danger)]"
+        >
           {error}
         </div>
       )}
 
-      <section className="mt-12">
-        <h2 className="mb-3 text-xs uppercase tracking-wider text-[var(--color-muted)]">
+      <section className="mt-14">
+        <h2 className="mb-3 text-xs font-medium uppercase tracking-[0.05em] text-[var(--color-muted)]">
           Your landscapes
         </h2>
         <LandscapeList landscapes={landscapes} onDelete={onDelete} />
