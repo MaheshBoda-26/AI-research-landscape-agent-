@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Data artifacts (sqlite db, arXiv response cache, HF model cache)
+data/
+
+# Secrets
+.env
+.jwt_secret
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Tooling metadata
+.freebuff/
