@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #0b1020;
+  --color-panel: #121a2f;
+  --color-panel-2: #182142;
+  --color-edge: #26314f;
+  --color-ink: #e6ebf5;
+  --color-muted: #8c9ab8;
+  --color-accent: #6ea8fe;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-synthesis-weight: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* React Flow needs its stylesheet; these keep it consistent with the theme. */
+.react-flow__attribution {
+  background: transparent;
+  color: var(--color-muted);
+}
+
+.react-flow__node {
+  font-family: inherit;
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgb(110 168 254 / 45%);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgb(110 168 254 / 0%);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgb(110 168 254 / 0%);
+  }
+}
+
+.stage-running {
+  animation: pulse-ring 1.6s ease-out infinite;
+}
