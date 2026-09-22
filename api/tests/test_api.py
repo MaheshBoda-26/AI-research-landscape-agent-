@@ -13,7 +13,6 @@ produces a viewable landscape even with no model available.
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,7 @@ from fastapi.testclient import TestClient
 import main
 import store
 from conftest import make_paper
-from models import Paper, PaperExtraction, RankedPaper, StageEvent, StageProgress
+from models import Paper, PaperExtraction, RankedPaper
 from pipeline import cluster as cluster_mod
 from pipeline import retrieve as retrieve_mod
 
@@ -125,13 +124,17 @@ def patched(monkeypatch):
 
 @pytest.fixture
 def client(tmp_path: Path, patched):
-    """A TestClient whose database lives in tmp_path."""
-    import os
+    """A TestClient whose database lives in tmp_path.
 
-    os.environ["DB_PATH"] = str(tmp_path / "api.db")
-    os.environ["RETRIEVAL_CACHE_DIR"] = str(tmp_path / "cache")
-    os.environ.pop("NVIDIA_API_KEY", None)
-    os.environ.pop("OPENROUTER_API_KEY", None)
+    Env vars are set through the same ``monkeypatch`` instance the leaf patches
+    use, so both are undone together.
+    """
+    monkeypatch = patched
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "api.db"))
+    monkeypatch.setenv("RETRIEVAL_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("ARXIV_OFFLINE", "1")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with TestClient(main.app) as test_client:
         yield test_client
 
@@ -255,19 +258,19 @@ def test_a_throttled_arxiv_produces_an_error_frame_not_a_crash(client, monkeypat
     assert len(errors) == 1
     assert errors[0]["retryable"] is True
     assert "429" in errors[0]["message"]
-    assert all(data["status"] != "error" or True for _, data in frames)
+    # A throttled run yields no ``done`` frame, so the client does not navigate.
+    assert not any(event == "done" for event, _ in frames)
 
 
-def test_a_throttled_run_marks_the_landscape_failed(client, monkeypatch):
-    monkeypatch.setattr(
-        retrieve_mod,
-        "fetch_candidates",
-        lambda *a, **k: (_ for _ in ()).throw(retrieve_mod.RetrievalError("boom")),
-    )
-    run_stream(client)
-    summaries = client.get("/v1/landscapes").json()
+def test_a_failed_retrieval_creates_no_landscape(client, monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise retrieve_mod.RetrievalError("arXiv is unreachable")
+
+    monkeypatch.setattr(retrieve_mod, "fetch_candidates", boom)
+    frames = run_stream(client)
+    assert any(event == "error" for event, _ in frames)
     # Nothing was created: retrieval failed before the landscape existed.
-    assert summaries == []
+    assert client.get("/v1/landscapes").json() == []
 
 
 def test_an_empty_corpus_is_reported_plainly(client, monkeypatch):
