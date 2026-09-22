@@ -155,9 +155,14 @@ class LLMClient:
             from openai import OpenAI
 
             if not settings.llm_api_key:
+                key_var = (
+                    "NVIDIA_API_KEY"
+                    if settings.llm_provider == "nim"
+                    else "OPENROUTER_API_KEY"
+                )
                 raise LLMError(
-                    "No API key configured for LLM_PROVIDER="
-                    f"{settings.llm_provider}. Set the matching key in .env."
+                    f"{key_var} is not set (LLM_PROVIDER={settings.llm_provider}). "
+                    "Copy .env.example to .env and fill it in."
                 )
             self._client = OpenAI(
                 api_key=settings.llm_api_key,
@@ -231,12 +236,11 @@ class LLMClient:
                 self.failures += 1
                 return None
 
-            if raw is None:
-                self.failures += 1
-                return None
-
+            # An empty or whitespace response is a malformed response, not a
+            # transport failure: it is worth the same repair attempt as invalid
+            # JSON, and providers do sometimes return nothing on a bad route.
             try:
-                return parse_into(raw, schema)
+                return parse_into(raw or "", schema)
             except ValidationError as exc:
                 if attempt >= repairs:
                     logger.warning(
@@ -289,7 +293,7 @@ class LLMClient:
                         content = response.choices[0].message.content
                     except (AttributeError, IndexError, KeyError) as exc:
                         raise LLMError(f"Malformed completion shape: {exc}") from exc
-                    return content or None
+                    return content
 
             # Exponential backoff with jitter, so parallel callers do not
             # synchronise their retries against a throttled provider.
@@ -300,9 +304,31 @@ class LLMClient:
         raise LLMError(f"LLM request failed after retries: {last_error}")
 
 
+def build_completer(settings: Settings) -> LLMClient | None:
+    """Return a client when one can be built, else ``None``.
+
+    Returning ``None`` rather than raising is deliberate: every pipeline stage
+    degrades without an LLM (retrieval and reranking still work), so a missing
+    key downgrades the run instead of preventing it.
+    """
+    if not settings.llm_api_key or not settings.llm_model:
+        return None
+    try:
+        return LLMClient(settings)
+    except LLMError as exc:
+        logger.warning("No LLM client (%s); continuing without one", exc)
+        return None
+
+
 def _brief(exc: Exception, limit: int = 400) -> str:
     text = json.dumps(exc.errors()[:3], default=str) if isinstance(exc, ValidationError) else str(exc)
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-__all__ = ["LLMClient", "LLMError", "candidate_json_payloads", "parse_into"]
+__all__ = [
+    "LLMClient",
+    "LLMError",
+    "build_completer",
+    "candidate_json_payloads",
+    "parse_into",
+]

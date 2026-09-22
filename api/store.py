@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS landscape_papers (
   paper_id TEXT NOT NULL REFERENCES papers(paper_id),
   rank INTEGER NOT NULL,
   relevance_score REAL NOT NULL,
+  cross_encoder_logit REAL,
   rerank_source TEXT NOT NULL DEFAULT 'cross-encoder',
   rationale TEXT DEFAULT '',
   is_seed INTEGER NOT NULL DEFAULT 0,
@@ -220,11 +221,31 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+#: Columns added after the first release. ``CREATE TABLE IF NOT EXISTS`` cannot
+#: add a column to an existing table, so additive changes are applied explicitly
+#: here; a user's database outlives any single schema change.
+_ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("landscape_papers", "cross_encoder_logit", "REAL"),
+)
+
+
+def _apply_additive_columns(conn: sqlite3.Connection) -> None:
+    for table, column, column_type in _ADDITIVE_COLUMNS:
+        existing = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not existing:  # table itself is missing; CREATE handled it
+            continue
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
 def init_db(db_path: Path | str) -> None:
     """Apply the schema. Idempotent: safe to call on every startup."""
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _apply_additive_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -562,16 +583,19 @@ def link_paper(
     rerank_source: str,
     rationale: str = "",
     is_seed: bool = False,
+    cross_encoder_logit: float | None = None,
 ) -> None:
     """Attach a paper to a landscape, preserving any existing x/y position."""
     conn.execute(
         """
         INSERT INTO landscape_papers (landscape_id, paper_id, rank, relevance_score,
-                                      rerank_source, rationale, is_seed, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                      cross_encoder_logit, rerank_source, rationale,
+                                      is_seed, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(landscape_id, paper_id) DO UPDATE SET
             rank = excluded.rank,
             relevance_score = excluded.relevance_score,
+            cross_encoder_logit = excluded.cross_encoder_logit,
             rerank_source = excluded.rerank_source,
             rationale = excluded.rationale,
             is_seed = excluded.is_seed
@@ -581,6 +605,7 @@ def link_paper(
             paper_id,
             rank,
             relevance_score,
+            cross_encoder_logit,
             rerank_source,
             rationale,
             1 if is_seed else 0,
@@ -592,8 +617,8 @@ def link_paper(
 def fetch_landscape_papers(conn: sqlite3.Connection, landscape_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT lp.rank, lp.relevance_score, lp.rerank_source, lp.rationale,
-               lp.is_seed, lp.cluster_id, lp.x, lp.y, lp.added_at,
+        SELECT lp.rank, lp.relevance_score, lp.cross_encoder_logit, lp.rerank_source,
+               lp.rationale, lp.is_seed, lp.cluster_id, lp.x, lp.y, lp.added_at,
                p.paper_id, p.version, p.title, p.abstract, p.authors_json,
                p.published, p.primary_category, p.categories_json, p.abs_url, p.pdf_url
         FROM landscape_papers lp JOIN papers p ON p.paper_id = lp.paper_id

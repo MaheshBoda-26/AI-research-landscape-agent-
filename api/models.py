@@ -30,13 +30,19 @@ EdgeKind = Literal["extends", "contradicts", "applies", "shares_method"]
 Novelty = Literal["incremental", "substantial", "unclear"]
 LandscapeStatus = Literal["running", "ready", "failed"]
 
-# Fixed execution order. The SSE stream and the UI timeline both assume this.
+#: Fixed execution order. The SSE stream and the UI timeline both assume this.
+#:
+#: ``layout`` runs *before* ``synthesis`` even though the user-facing story is
+#: retrieval -> rerank -> extraction -> synthesis, because synthesis consumes the
+#: computed clusters: it names them and writes the narrative around them. Putting
+#: synthesis first would mean synthesizing a landscape whose groupings do not
+#: exist yet. To the user, layout simply reads as "mapping the field".
 STAGE_ORDER: tuple[StageName, ...] = (
     "retrieval",
     "rerank",
     "extraction",
-    "synthesis",
     "layout",
+    "synthesis",
 )
 
 UNCLUSTERED_LABEL = -1
@@ -176,8 +182,21 @@ class JudgeBatch(BaseModel):
     scores: list[JudgeScore] = Field(default_factory=list)
 
 
+class ClusterNaming(BaseModel):
+    """Naming of a single cluster, as returned by one per-cluster LLM call.
+
+    Deliberately lacks ``local_label``: the caller already knows which cluster it
+    asked about, and letting the model echo the id back invites it to name the
+    wrong one.
+    """
+
+    label: str
+    description: str = ""
+    representative_paper_ids: list[str] = Field(default_factory=list)
+
+
 class ClusterLabel(BaseModel):
-    """LLM naming of one computed cluster."""
+    """LLM naming of one computed cluster, bound to its true label."""
 
     local_label: int
     label: str
